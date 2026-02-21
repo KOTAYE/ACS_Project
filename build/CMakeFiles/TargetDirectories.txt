@@ -1,0 +1,3 @@
+C:/Users/munex/CLionProjects/askProjectCUDA/build/CMakeFiles/askProjectCUDA.dir
+C:/Users/munex/CLionProjects/askProjectCUDA/build/CMakeFiles/ALL_BUILD.dir
+C:/Users/munex/CLionProjects/askProjectCUDA/build/CMakeFiles/ZERO_CHECK.dir

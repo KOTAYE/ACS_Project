@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="18.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <CustomBuild Include="C:\Users\munex\CLionProjects\askProjectCUDA\build\CMakeFiles\bf8723031d50416396a84edd3783abe9\generate.stamp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="CMake Rules">
+      <UniqueIdentifier>{FCB4D792-B58B-3954-AB73-311EB95EF6D4}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>
