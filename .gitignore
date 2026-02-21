@@ -1,0 +1,145 @@
+##################################
+# Compiled object files
+##################################
+*.o
+*.obj
+*.lo
+*.slo
+*.ko
+*.elf
+
+##################################
+# Executables
+##################################
+*.exe
+*.out
+*.app
+*.i*86
+*.x86_64
+*.hex
+
+##################################
+# Static & Dynamic Libraries
+##################################
+*.a
+*.la
+*.lib
+*.dll
+*.dylib
+*.so
+*.so.*
+*.exp
+
+##################################
+# Debug files
+##################################
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+##################################
+# Build folders
+##################################
+build/
+Build/
+bin/
+Bin/
+out/
+Out/
+debug/
+Debug/
+release/
+Release/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+compile_commands.json
+Makefile
+makefile
+GNUmakefile
+autom4te.cache/
+
+##################################
+# CMake
+##################################
+CMakeScripts/
+Testing/
+cmake_install.cmake
+install_manifest.txt
+CTestTestfile.cmake
+_deps/
+
+##################################
+# Autotools
+##################################
+aclocal.m4
+m4/
+config.log
+config.status
+configure
+libtool
+
+##################################
+# Ninja
+##################################
+.ninja_deps
+.ninja_log
+build.ninja
+
+##################################
+# IDE: Visual Studio
+##################################
+.vs/
+*.vcxproj.user
+*.vcxproj.filters
+*.sln
+*.VC.db
+*.opensdf
+*.sdf
+ipch/
+
+##################################
+# IDE: CLion
+##################################
+.idea/
+cmake-build-debug/
+cmake-build-release/
+
+##################################
+# IDE: VSCode
+##################################
+.vscode/
+
+##################################
+# Coverage / Profiling
+##################################
+*.gcno
+*.gcda
+*.gcov
+*.prof
+*.profraw
+*.profdata
+coverage/
+*.lcov
+
+##################################
+# Temporary files
+##################################
+*.tmp
+*.temp
+*.swp
+*.bak
+*~
+*.log
+
+##################################
+# OS files
+##################################
+.DS_Store
+Thumbs.db
+
+##################################
+# Cache
+##################################
+.cache/
