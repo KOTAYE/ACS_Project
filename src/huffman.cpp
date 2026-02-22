@@ -133,6 +133,8 @@ int huffman_encode_block_64(const float* block, uint8_t* encoded, int encoded_ma
     int bit_pos = 0;
     int max_bytes = encoded_max_size - header_size;
     uint8_t* wr_buf = encoded + header_size;
+    for (int i = 0; i < max_bytes; i++)
+        wr_buf[i] = 0;
 
     for (int i = 0; i < BLOCK_BYTES; i++) {
         int s = bytes[i];

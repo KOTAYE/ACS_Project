@@ -1,4 +1,5 @@
 #include <iostream>
+#include <string>
 #include <vector>
 #include <cstdint>
 
@@ -22,7 +23,7 @@ static void process_channel(const float* src_channel,
     float idct_out[64];
     uint8_t encoded[4096];
     int encoded_len;
-    const float quant_scale = 16.0f;
+    const float quant_scale = 8.0f;
 
     for (int by = 0; by < blocks_y; ++by) {
         for (int bx = 0; bx < blocks_x; ++bx) {
@@ -93,6 +94,15 @@ int main(int argc, char* argv[]) {
         double overall_psnr = compute_psnr(overall_mse);
 
         std::cout << "  Overall  : MSE = " << overall_mse << ", PSNR = " << overall_psnr << " dB\n\n";
+
+        std::string out_path(path);
+        std::size_t dot = out_path.rfind('.');
+        if (dot != std::string::npos)
+            out_path.insert(dot, "_reconstructed");
+        else
+            out_path += "_reconstructed.png";
+        if (save_image(out_path.c_str(), reconstructed))
+            std::cout << "  Saved: " << out_path << "\n";
 
         frame_destroy(original);
         frame_destroy(reconstructed);
