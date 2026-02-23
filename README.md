@@ -1,4 +1,3 @@
-# Lab work 3: Розпаралелення обрахунку інтегралу заданої функції
 Authors (team):<br>
 Denys Maletskiy (https://github.com/maletsden),<br>
 Viktor Syrotiuk (https://github.com/KOTAYE),<br>
