@@ -24,7 +24,6 @@ static void process_channel(const float* src_channel,
     uint8_t encoded[4096];
     int encoded_len;
     const float quant_scale = 8.0f;
-
     for (int by = 0; by < blocks_y; ++by) {
         for (int bx = 0; bx < blocks_x; ++bx) {
             extract_block_8x8(src_channel, padded_w, bx, by, block_in);
