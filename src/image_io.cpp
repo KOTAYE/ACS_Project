@@ -5,12 +5,17 @@
 #include <vector>
 #include <cstdio>
 #include <algorithm>
-#include <string>
-
+#include <string_view>
+#include <memory>
 
 Frame load_image(const char* path) {
-    int w, h, ch;
-    unsigned char* raw = stbi_load(path, &w, &h, &ch, 0);
+    int w = 0, h = 0, ch = 0;
+    
+    struct StbiDeleter {
+        void operator()(unsigned char* p) const { stbi_image_free(p); }
+    };
+    std::unique_ptr<unsigned char, StbiDeleter> raw(stbi_load(path, &w, &h, &ch, 0));
+    
     if (!raw) {
         std::fprintf(stderr, "[load_image] Cannot load '%s': %s\n",
                      path, stbi_failure_reason());
@@ -22,42 +27,40 @@ Frame load_image(const char* path) {
     for (int y = 0; y < h; ++y) {
         for (int x = 0; x < w; ++x) {
             for (int c = 0; c < ch; ++c) {
-                float val = static_cast<float>(raw[(y * w + x) * ch + c]);
+                const float val = static_cast<float>(raw.get()[(y * w + x) * ch + c]);
                 f.at(c, x, y) = val;
             }
         }
     }
 
-    stbi_image_free(raw);
     return f;
 }
 
-
 bool save_image(const char* path, const Frame& frame) {
-    int w  = frame.width;
-    int h  = frame.height;
-    int ch = frame.channels;
+    const int w  = frame.width;
+    const int h  = frame.height;
+    const int ch = frame.channels;
 
     std::vector<unsigned char> buf(w * h * ch);
 
     for (int y = 0; y < h; ++y) {
         for (int x = 0; x < w; ++x) {
             for (int c = 0; c < ch; ++c) {
-                float val = frame.at(c, x, y);
-                val = std::max(0.0f, std::min(255.0f, val));
-                buf[(y * w + x) * ch + c] = static_cast<unsigned char>(val + 0.5f);
+                const float val = frame.at(c, x, y);
+                const float clamped = std::clamp(val, 0.0f, 255.0f);
+                buf[(y * w + x) * ch + c] = static_cast<unsigned char>(clamped + 0.5f);
             }
         }
     }
 
-    std::string p(path);
+    const std::string_view p(path);
     int ok = 0;
-    if (p.size() >= 4 && p.substr(p.size() - 4) == ".png") {
+    
+    if (p.ends_with(".png")) {
         ok = stbi_write_png(path, w, h, ch, buf.data(), w * ch);
-    } else if (p.size() >= 4 && p.substr(p.size() - 4) == ".bmp") {
+    } else if (p.ends_with(".bmp")) {
         ok = stbi_write_bmp(path, w, h, ch, buf.data());
-    } else if (p.size() >= 4 &&
-              (p.substr(p.size() - 4) == ".jpg" || p.substr(p.size() - 5) == ".jpeg")) {
+    } else if (p.ends_with(".jpg") || p.ends_with(".jpeg")) {
         ok = stbi_write_jpg(path, w, h, ch, buf.data(), 95);
     } else {
         ok = stbi_write_png(path, w, h, ch, buf.data(), w * ch);

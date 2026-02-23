@@ -1,5 +1,6 @@
 #include <iostream>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <cstdint>
 
@@ -13,28 +14,28 @@
 
 static void process_channel(const float* src_channel,
                              float* dst_channel,
-                             int padded_w, int padded_h)
+                             int padded_w, int padded_h,
+                             const QuantMatrix& qm)
 {
-    int blocks_x = padded_w / 8;
-    int blocks_y = padded_h / 8;
+    const int blocks_x = padded_w / 8;
+    const int blocks_y = padded_h / 8;
 
     float block_in[64];
     float dct_out[64];
     float idct_out[64];
     uint8_t encoded[4096];
-    int encoded_len;
-    const float quant_scale = 8.0f;
+
     for (int by = 0; by < blocks_y; ++by) {
         for (int bx = 0; bx < blocks_x; ++bx) {
             extract_block_8x8(src_channel, padded_w, bx, by, block_in);
             level_shift(block_in, -128.0f);
             dct2d_separable(block_in, dct_out);
 
-            quantize_block_64(dct_out, quant_scale);
-            encoded_len = huffman_encode_block_64(dct_out, encoded, (int)sizeof(encoded));
+            quantize_block_64(dct_out, qm);
+            const int encoded_len = huffman_encode_block_64(dct_out, encoded, (int)sizeof(encoded));
             if (encoded_len > 0)
                 huffman_decode_block_64(encoded, encoded_len, dct_out);
-            dequantize_block_64(dct_out, quant_scale);
+            dequantize_block_64(dct_out, qm);
 
             idct2d_separable(dct_out, idct_out);
             level_shift(idct_out, +128.0f);
@@ -45,13 +46,25 @@ static void process_channel(const float* src_channel,
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <image1>...\n";
+        std::cerr << "Usage: " << argv[0] << " [--quality 1..100] <image1>...\n";
         return 1;
+    }
+
+    int quality = 50;
+    int first_image_arg = 1;
+    if (argc >= 3 && (std::string_view(argv[1]) == "--quality" ||
+                      std::string_view(argv[1]) == "-q")) {
+        quality = std::stoi(argv[2]);
+        if (quality < 1 || quality > 100) {
+            std::cerr << "Error: quality must be between 1 and 100.\n";
+            return 1;
+        }
+        first_image_arg = 3;
     }
 
     dct_init_lut();
 
-    for (int i = 1; i < argc; ++i) {
+    for (int i = first_image_arg; i < argc; ++i) {
         const char* path = argv[i];
         Frame original = load_image(path);
         
@@ -59,11 +72,16 @@ int main(int argc, char* argv[]) {
 
         Frame reconstructed = frame_create(original.width, original.height, original.channels);
 
+        const QuantMatrix luma_qm   = make_quant_matrix(kJpegLumaQuant, quality);
+        const QuantMatrix chroma_qm = make_quant_matrix(kJpegChromaQuant, quality);
+
         for (int ch = 0; ch < original.channels; ++ch) {
+            const QuantMatrix& qm = (ch == 0) ? luma_qm : chroma_qm;
             process_channel(original.channel_ptr(ch),
                             reconstructed.channel_ptr(ch),
                             original.padded_width,
-                            original.padded_height);
+                            original.padded_height,
+                            qm);
         }
 
         double total_mse = 0.0;
