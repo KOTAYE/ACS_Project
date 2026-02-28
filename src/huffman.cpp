@@ -167,3 +167,78 @@ int huffman_decode_block_64(const uint8_t* encoded, int encoded_len, float* bloc
     }
     return 0;
 }
+
+int huffman_encode_bytes(const uint8_t* in_data, int in_len, uint8_t* encoded, int encoded_max_size) {
+    constexpr int header_size = kNumSymbols * static_cast<int>(sizeof(uint16_t));
+    if (encoded_max_size < header_size) return -1;
+
+    std::array<uint32_t, kNumSymbols> true_freq = {0};
+    for (int i = 0; i < in_len; ++i) {
+        ++true_freq[in_data[i]];
+    }
+
+    uint32_t max_freq = 0;
+    for (int i = 0; i < kNumSymbols; ++i) {
+        if (true_freq[i] > max_freq) max_freq = true_freq[i];
+    }
+
+    auto* freq = reinterpret_cast<uint16_t*>(encoded);
+    if (max_freq <= 65535) {
+        for (int i = 0; i < kNumSymbols; ++i) {
+            freq[i] = static_cast<uint16_t>(true_freq[i]);
+        }
+    } else {
+        const float scale = 65535.0f / static_cast<float>(max_freq);
+        for (int i = 0; i < kNumSymbols; ++i) {
+            if (true_freq[i] > 0) {
+                uint32_t scaled = static_cast<uint32_t>(true_freq[i] * scale);
+                if (scaled == 0) scaled = 1;
+                freq[i] = static_cast<uint16_t>(scaled);
+            } else {
+                freq[i] = 0;
+            }
+        }
+    }
+
+    const int root = build_tree(freq);
+    if (root < 0) return -1;
+    build_codes(root);
+
+    if (nodes[root].left < 0 && nodes[root].right < 0) {
+        code_len [nodes[root].symbol] = 1;
+        code_bits[nodes[root].symbol] = 0;
+    }
+
+    const int max_bytes = encoded_max_size - header_size;
+    uint8_t* wr_buf = encoded + header_size;
+    std::memset(wr_buf, 0, static_cast<std::size_t>(max_bytes));
+
+    int byte_pos = 0, bit_pos = 0;
+    for (int i = 0; i < in_len; ++i) {
+        const int s = in_data[i];
+        write_bits(wr_buf, byte_pos, bit_pos, max_bytes, code_bits[s], code_len[s]);
+        if (byte_pos >= max_bytes) return -1;
+    }
+    if (bit_pos != 0) ++byte_pos;
+    return header_size + byte_pos;
+}
+
+int huffman_decode_bytes(const uint8_t* encoded, int encoded_len, uint8_t* out_data, int out_len) {
+    constexpr int header_size = kNumSymbols * static_cast<int>(sizeof(uint16_t));
+    if (encoded_len < header_size) return -1;
+
+    const auto* freq = reinterpret_cast<const uint16_t*>(encoded);
+    const int root = build_tree(freq);
+    if (root < 0) return -1;
+
+    int byte_pos = 0, bit_pos = 0;
+    const uint8_t* rd_buf = encoded + header_size;
+    const int rd_len = encoded_len - header_size;
+
+    for (int i = 0; i < out_len; ++i) {
+        const int s = decode_symbol(rd_buf, byte_pos, bit_pos, rd_len, root);
+        if (s < 0) return -1;
+        out_data[i] = static_cast<uint8_t>(s);
+    }
+    return 0;
+}

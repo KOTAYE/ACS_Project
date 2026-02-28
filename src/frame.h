@@ -9,22 +9,22 @@
         int width = 0;
         int height = 0;
         int channels = 0;
-        int padded_width = 0;
-        int padded_height = 0;
-        float* data = nullptr; // CHW-буфер
+        int padded_width[3] = {0};
+        int padded_height[3] = {0};
+        float* data[3] = {nullptr};
 
         float* channel_ptr(int ch) {
-            return data + ch * padded_width * padded_height;
+            return data[ch];
         }
         const float* channel_ptr(int ch) const {
-            return data + ch * padded_width * padded_height;
+            return data[ch];
         }
 
         float& at(int ch, int x, int y) {
-            return data[ch * padded_width * padded_height + y * padded_width + x];
+            return data[ch][y * padded_width[ch] + x];
         }
         float at(int ch, int x, int y) const {
-            return data[ch * padded_width * padded_height + y * padded_width + x];
+            return data[ch][y * padded_width[ch] + x];
         }
     };
 
@@ -33,17 +33,28 @@
         f.width = width;
         f.height = height;
         f.channels = channels;
-        f.padded_width = pad8(width);
-        f.padded_height = pad8(height);
-        size_t total = (size_t)f.channels * f.padded_width * f.padded_height;
-        f.data = (float*)std::calloc(total, sizeof(float));
-        assert(f.data);
+        for (int ch = 0; ch < channels; ++ch) {
+            int w = width;
+            int h = height;
+            if (ch > 0 && channels == 3) {
+                // 4:2:0 Subsampling for Chroma
+                w = (width + 1) / 2;
+                h = (height + 1) / 2;
+            }
+            f.padded_width[ch] = pad8(w);
+            f.padded_height[ch] = pad8(h);
+            size_t total = (size_t)f.padded_width[ch] * f.padded_height[ch];
+            f.data[ch] = (float*)std::calloc(total, sizeof(float));
+            assert(f.data[ch]);
+        }
         return f;
     }
 
     inline void frame_destroy(Frame& f) {
-        std::free(f.data);
-        f.data = nullptr;
+        for (int ch = 0; ch < f.channels; ++ch) {
+            std::free(f.data[ch]);
+            f.data[ch] = nullptr;
+        }
     }
 
     struct Flipbook {

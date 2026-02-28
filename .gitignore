@@ -144,3 +144,6 @@ Thumbs.db
 # Cache
 ##################################
 .cache/
+
+Frames/
+frames_restored/
