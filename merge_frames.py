@@ -42,4 +42,4 @@ for image in images:
 
 video.release()
 
-print("✅ Відео створено:", output_video)
+print("Відео створено:", output_video)
