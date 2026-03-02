@@ -4,7 +4,10 @@
 
 #include "dct.h"
 #include "codec.h"
+
+#ifdef USE_CUDA
 #include "cuda_kernels.cuh"
+#endif
 
 void print_usage(const char* prog_name) {
     std::cerr << "Usage:\n"
@@ -19,14 +22,16 @@ int main(int argc, char* argv[]) {
     }
 
     dct_init_lut();
+#ifdef USE_CUDA
     cuda_init();
+#endif
 
     std::string mode = argv[1];
 
     if (mode == "compress") {
         int quality = 50;
         int in_arg_idx = 2;
-        
+
         if (argc >= 4 && (std::string_view(argv[2]) == "-q" || std::string_view(argv[2]) == "--quality")) {
             quality = std::stoi(argv[3]);
             if (quality < 1 || quality > 100) {
@@ -59,5 +64,8 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+#ifdef USE_CUDA
+    cuda_cleanup();
+#endif
     return 0;
 }
