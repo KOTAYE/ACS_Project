@@ -34,6 +34,7 @@ struct BinHeader {
     int32_t channels;
     int32_t quality;
     int32_t frame_count;
+    int32_t use_ycbcr = 1;
 };
 #pragma pack(pop)
 
@@ -85,10 +86,10 @@ void rle_decode_zeros(const std::vector<int16_t>& in, std::vector<int16_t>& out)
     }
 }
 
-// ── Convert RGB -> YCbCr (Parallel with OpenMP) ───────────────────────────
-Frame rgb_to_ycbcr_parallel(uint8_t* raw, int w, int h, int ch) {
-    Frame f = frame_create(w, h, ch);
-    if (ch >= 3) {
+// ── Convert RGB -> YCbCr or raw split (Parallel with OpenMP) ───────────────
+Frame rgb_to_planes_parallel(uint8_t* raw, int w, int h, int ch, bool use_ycbcr) {
+    Frame f = frame_create(w, h, ch, use_ycbcr);
+    if (use_ycbcr && ch >= 3) {
         #ifdef USE_OMP
         #pragma omp parallel for
         #endif
@@ -124,13 +125,13 @@ Frame rgb_to_ycbcr_parallel(uint8_t* raw, int w, int h, int ch) {
     return f;
 }
 
-// ── Convert YCbCr -> RGB (Parallel with OpenMP) ───────────────────────────
-void ycbcr_to_rgb_parallel(const Frame& f, std::vector<uint8_t>& out_rgb) {
+// ── Convert YCbCr/raw planes -> RGB (Parallel with OpenMP) ────────────────
+void planes_to_rgb_parallel(const Frame& f, std::vector<uint8_t>& out_rgb, bool use_ycbcr) {
     int w = f.width;
     int h = f.height;
     int ch = f.channels;
 
-    if (ch >= 3) {
+    if (use_ycbcr && ch >= 3) {
         #ifdef USE_OMP
         #pragma omp parallel for
         #endif
@@ -166,7 +167,7 @@ void ycbcr_to_rgb_parallel(const Frame& f, std::vector<uint8_t>& out_rgb) {
     }
 }
 
-void compress_flipbook(const std::string& in_dir, const std::string& out_path, int quality) {
+void compress_flipbook(const std::string& in_dir, const std::string& out_path, int quality, bool use_ycbcr) {
     if (!fs::exists(in_dir) || !fs::is_directory(in_dir)) {
         std::cerr << "Input must be a valid directory containing frames.\n";
         return;
@@ -203,13 +204,14 @@ void compress_flipbook(const std::string& in_dir, const std::string& out_path, i
     header.channels = img_ch;
     header.quality = quality;
     header.frame_count = static_cast<int32_t>(frames.size());
+    header.use_ycbcr = use_ycbcr ? 1 : 0;
     out.write(reinterpret_cast<const char*>(&header), sizeof(header));
 
     const QuantMatrix luma_qm   = make_quant_matrix(kJpegLumaQuant, quality);
     const QuantMatrix chroma_qm = make_quant_matrix(kJpegChromaQuant, quality);
 
-    Frame prev_recon = frame_create(img_w, img_h, img_ch);
-    Frame curr_recon = frame_create(img_w, img_h, img_ch);
+    Frame prev_recon = frame_create(img_w, img_h, img_ch, use_ycbcr);
+    Frame curr_recon = frame_create(img_w, img_h, img_ch, use_ycbcr);
 
     std::vector<int16_t> channel_buffer;
     std::vector<uint8_t> encoded;
@@ -246,7 +248,7 @@ void compress_flipbook(const std::string& in_dir, const std::string& out_path, i
         }
 #endif
 
-        Frame current = rgb_to_ycbcr_parallel(raw, img_w, img_h, img_ch);
+        Frame current = rgb_to_planes_parallel(raw, img_w, img_h, img_ch, use_ycbcr);
         stbi_image_free(raw);
 
         bool is_keyframe = (f_idx == 0);
@@ -351,15 +353,26 @@ void decompress_flipbook(const std::string& in_path, const std::string& out_dir)
 
     fs::create_directories(out_dir);
 
-    Frame prev_recon = frame_create(header.width, header.height, header.channels);
-    Frame curr_recon = frame_create(header.width, header.height, header.channels);
+    bool use_ycbcr = (header.use_ycbcr != 0);
+
+    Frame prev_recon = frame_create(header.width, header.height, header.channels, use_ycbcr);
+    Frame curr_recon = frame_create(header.width, header.height, header.channels, use_ycbcr);
 
     const QuantMatrix luma_qm   = make_quant_matrix(kJpegLumaQuant, header.quality);
     const QuantMatrix chroma_qm = make_quant_matrix(kJpegChromaQuant, header.quality);
 
+    // Use fast PNG compression (level 1 instead of default 8)
+    stbi_write_png_compression_level = 1;
+
+    // Ring buffer of N frames for concurrent PNG writes
+    constexpr int NUM_WRITE_BUFS = 4;
+    const size_t rgb_size = static_cast<size_t>(header.width) * header.height * header.channels;
+
     std::vector<int16_t> channel_buffer;
     std::vector<uint8_t> encoded;
-    std::vector<uint8_t> rgb_buf(header.width * header.height * header.channels);
+    std::vector<std::vector<uint8_t>> rgb_ring(NUM_WRITE_BUFS);
+    for (auto& buf : rgb_ring) buf.resize(rgb_size);
+    std::future<void> write_futures[NUM_WRITE_BUFS];
 
     std::cout << "Decompressing " << header.frame_count << " frames to " << out_dir << "...\n";
 
@@ -423,20 +436,34 @@ void decompress_flipbook(const std::string& in_path, const std::string& out_dir)
             }
         }
 
-        // Parallel YCbCr -> RGB
-        ycbcr_to_rgb_parallel(curr_recon, rgb_buf);
+        int slot = f_idx % NUM_WRITE_BUFS;
+
+        // Wait for this slot's previous write to complete before reusing its buffer
+        if (write_futures[slot].valid()) write_futures[slot].get();
+
+        // YCbCr/raw -> RGB into this slot's buffer
+        planes_to_rgb_parallel(curr_recon, rgb_ring[slot], use_ycbcr);
 
         char filename[256];
         std::snprintf(filename, sizeof(filename), "/frame_%04d.png", f_idx);
         std::string out_path = out_dir + filename;
+        int w = header.width, h = header.height, ch_count = header.channels;
+        uint8_t* buf_ptr = rgb_ring[slot].data();
 
-        stbi_write_png(out_path.c_str(), header.width, header.height, header.channels,
-                       rgb_buf.data(), header.width * header.channels);
+        write_futures[slot] = std::async(std::launch::async,
+            [out_path, buf_ptr, w, h, ch_count]() {
+                stbi_write_png(out_path.c_str(), w, h, ch_count, buf_ptr, w * ch_count);
+            });
 
         std::cout << "\r  Progress: " << f_idx + 1 << "/" << header.frame_count << std::flush;
 
         std::swap(curr_recon.data, prev_recon.data);
     }
+
+    // Wait for all remaining writes
+    for (int i = 0; i < NUM_WRITE_BUFS; ++i)
+        if (write_futures[i].valid()) write_futures[i].get();
+
     std::cout << "\n  Finished decompressing flipbook.\n";
 
     frame_destroy(prev_recon);
