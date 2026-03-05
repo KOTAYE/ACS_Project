@@ -5,7 +5,8 @@
 void cuda_init();
 void cuda_cleanup();
 void cuda_alloc_frame_buffers(int width, int height, int channels,
-                              const float* luma_qm, const float* chroma_qm);
+                              const float* luma_qm, const float* chroma_qm,
+                              bool use_ycbcr = true);
 void cuda_free_frame_buffers();
 
 void cuda_upload_and_convert_rgb(const uint8_t* rgb_host,

@@ -20,7 +20,16 @@
     } while (0)
 
 
-__constant__ float d_cos[8][8];
+__constant__ float d_cos[8][8] = {
+    {1.0000000000f, 1.0000000000f, 1.0000000000f, 1.0000000000f, 1.0000000000f, 1.0000000000f, 1.0000000000f, 1.0000000000f},
+    {0.9807852804f, 0.8314696123f, 0.5555702330f, 0.1950903220f, -0.1950903220f, -0.5555702330f, -0.8314696123f, -0.9807852804f},
+    {0.9238795325f, 0.3826834324f, -0.3826834324f, -0.9238795325f, -0.9238795325f, -0.3826834324f, 0.3826834324f, 0.9238795325f},
+    {0.8314696123f, -0.1950903220f, -0.9807852804f, -0.5555702330f, 0.5555702330f, 0.9807852804f, 0.1950903220f, -0.8314696123f},
+    {0.7071067812f, -0.7071067812f, -0.7071067812f, 0.7071067812f, 0.7071067812f, -0.7071067812f, -0.7071067812f, 0.7071067812f},
+    {0.5555702330f, -0.9807852804f, 0.1950903220f, 0.8314696123f, -0.8314696123f, -0.1950903220f, 0.9807852804f, -0.5555702330f},
+    {0.3826834324f, -0.9238795325f, 0.9238795325f, -0.3826834324f, -0.3826834324f, 0.9238795325f, -0.9238795325f, 0.3826834324f},
+    {0.1950903220f, -0.5555702330f, 0.8314696123f, -0.9807852804f, 0.9807852804f, -0.8314696123f, 0.5555702330f, -0.1950903220f}
+};
 
 __constant__ int d_zigzag[64] = {
      0,  1,  5,  6, 14, 15, 27, 28,
@@ -95,6 +104,33 @@ __global__ void ycbcr_to_rgb_kernel(
     rgb[idx + 1] = static_cast<uint8_t>(fminf(fmaxf(G + 0.5f, 0.0f), 255.0f));
     rgb[idx + 2] = static_cast<uint8_t>(fminf(fmaxf(B + 0.5f, 0.0f), 255.0f));
     if (channels == 4) rgb[idx + 3] = 255;
+}
+
+
+__global__ void raw_to_planes_kernel(
+        const uint8_t* __restrict__ rgb,
+        float* __restrict__ planes[],
+        int width, int height, int channels, int padded_w)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+    const int idx = (y * width + x) * channels;
+    for (int c = 0; c < channels; ++c)
+        planes[c][y * padded_w + x] = static_cast<float>(rgb[idx + c]);
+}
+
+__global__ void planes_to_raw_kernel(
+        float* const __restrict__ planes[],
+        uint8_t* __restrict__ rgb,
+        int width, int height, int channels, int padded_w)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+    const int idx = (y * width + x) * channels;
+    for (int c = 0; c < channels; ++c)
+        rgb[idx + c] = static_cast<uint8_t>(fminf(fmaxf(planes[c][y * padded_w + x] + 0.5f, 0.0f), 255.0f));
 }
 
 
@@ -221,9 +257,12 @@ static cudaStream_t g_stream[MAX_CH] = {};
 static float*       g_d_qm[2]       = {};
 static int          g_num_ch         = 0;
 static bool         g_allocated      = false;
+static bool         g_use_ycbcr      = true;
 
 static int g_width = 0, g_height = 0, g_channels = 0;
 static int g_pw[MAX_CH] = {}, g_ph[MAX_CH] = {};
+
+static float** g_d_plane_ptrs = nullptr;
 
 static uint8_t* g_d_rgb_in  = nullptr;
 static uint8_t* g_d_rgb_out = nullptr;
@@ -233,11 +272,6 @@ static inline int pad8(int n) { return ((n + 7) / 8) * 8; }
 
 
 void cuda_init() {
-    float h_cos[8][8];
-    for (int k = 0; k < 8; ++k)
-        for (int n = 0; n < 8; ++n)
-            h_cos[k][n] = cosf(float(M_PI) * (2.f * n + 1.f) * k / 16.f);
-    CUDA_CHECK(cudaMemcpyToSymbol(d_cos, h_cos, sizeof(h_cos)));
     for (int i = 0; i < MAX_CH; ++i)
         CUDA_CHECK(cudaStreamCreate(&g_stream[i]));
 }
@@ -249,13 +283,15 @@ void cuda_cleanup() {
 }
 
 void cuda_alloc_frame_buffers(int width, int height, int channels,
-                              const float* luma_qm, const float* chroma_qm) {
+                              const float* luma_qm, const float* chroma_qm,
+                              bool use_ycbcr) {
     if (g_allocated) cuda_free_frame_buffers();
     g_num_ch = channels; g_width = width; g_height = height; g_channels = channels;
+    g_use_ycbcr = use_ycbcr;
 
     for (int ch = 0; ch < channels; ++ch) {
         int w = width, h = height;
-        if (ch > 0 && channels == 3) { w = (width+1)/2; h = (height+1)/2; }
+        if (use_ycbcr && ch > 0 && channels == 3) { w = (width+1)/2; h = (height+1)/2; }
         g_pw[ch] = pad8(w); g_ph[ch] = pad8(h);
         auto& b = g_ch[ch];
         b.pixels = size_t(g_pw[ch]) * g_ph[ch];
@@ -277,6 +313,11 @@ void cuda_alloc_frame_buffers(int width, int height, int channels,
     CUDA_CHECK(cudaMalloc(&g_d_rgb_in,  g_rgb_bytes));
     CUDA_CHECK(cudaMalloc(&g_d_rgb_out, g_rgb_bytes));
 
+    float* h_plane_ptrs[MAX_CH];
+    for (int ch = 0; ch < channels; ++ch) h_plane_ptrs[ch] = g_ch[ch].d_src;
+    CUDA_CHECK(cudaMalloc(&g_d_plane_ptrs, MAX_CH * sizeof(float*)));
+    CUDA_CHECK(cudaMemcpy(g_d_plane_ptrs, h_plane_ptrs, channels * sizeof(float*), cudaMemcpyHostToDevice));
+
     g_allocated = true;
 }
 
@@ -290,6 +331,7 @@ void cuda_free_frame_buffers() {
     for (auto& p : g_d_qm) { cudaFree(p); p = nullptr; }
     cudaFree(g_d_rgb_in);  g_d_rgb_in  = nullptr;
     cudaFree(g_d_rgb_out); g_d_rgb_out = nullptr;
+    if (g_d_plane_ptrs) { cudaFree(g_d_plane_ptrs); g_d_plane_ptrs = nullptr; }
     g_allocated = false;
 }
 
@@ -301,10 +343,16 @@ void cuda_upload_and_convert_rgb(const uint8_t* rgb_host,
     dim3 block(16, 16);
     dim3 grid((width + 15) / 16, (height + 15) / 16);
 
-    rgb_to_ycbcr_kernel<<<grid, block>>>(
-        g_d_rgb_in,
-        g_ch[0].d_src, g_ch[1].d_src, g_ch[2].d_src,
-        width, height, channels, g_pw[0], g_pw[1]);
+    if (g_use_ycbcr && channels >= 3) {
+        rgb_to_ycbcr_kernel<<<grid, block>>>(
+            g_d_rgb_in,
+            g_ch[0].d_src, g_ch[1].d_src, g_ch[2].d_src,
+            width, height, channels, g_pw[0], g_pw[1]);
+    } else {
+        raw_to_planes_kernel<<<grid, block>>>(
+            g_d_rgb_in, g_d_plane_ptrs,
+            width, height, channels, g_pw[0]);
+    }
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 }
@@ -355,9 +403,18 @@ void cuda_download_and_convert_rgb(uint8_t* rgb_host,
     dim3 block(16, 16);
     dim3 grid((width + 15) / 16, (height + 15) / 16);
 
-    ycbcr_to_rgb_kernel<<<grid, block>>>(
-        g_ch[0].d_curr, g_ch[1].d_curr, g_ch[2].d_curr,
-        g_d_rgb_out, width, height, channels, g_pw[0], g_pw[1]);
+    if (g_use_ycbcr && channels >= 3) {
+        ycbcr_to_rgb_kernel<<<grid, block>>>(
+            g_ch[0].d_curr, g_ch[1].d_curr, g_ch[2].d_curr,
+            g_d_rgb_out, width, height, channels, g_pw[0], g_pw[1]);
+    } else {
+        float* h_plane_ptrs[MAX_CH];
+        for (int ch = 0; ch < g_num_ch; ++ch) h_plane_ptrs[ch] = g_ch[ch].d_curr;
+        CUDA_CHECK(cudaMemcpy(g_d_plane_ptrs, h_plane_ptrs, g_num_ch * sizeof(float*), cudaMemcpyHostToDevice));
+        planes_to_raw_kernel<<<grid, block>>>(
+            g_d_plane_ptrs, g_d_rgb_out,
+            width, height, channels, g_pw[0]);
+    }
     CUDA_CHECK(cudaGetLastError());
 
     CUDA_CHECK(cudaMemcpy(rgb_host, g_d_rgb_out, g_rgb_bytes, cudaMemcpyDeviceToHost));

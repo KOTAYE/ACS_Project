@@ -20,7 +20,7 @@ set(INC_DIRS ${ROOT}/src ${ROOT}/stb)
 
 # ── CUDA ──────────────────────────────────────────────────
 add_executable(bench_cuda
-    main_bench.cpp
+    ${ROOT}/src/main_cuda.cpp
     ${ROOT}/src/codec.cpp
     ${ROOT}/src/cuda_kernels.cu
     ${SHARED_SRC}
@@ -33,7 +33,7 @@ set_target_properties(bench_cuda PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 find_package(OpenMP REQUIRED COMPONENTS CXX)
 
 add_executable(bench_omp
-    main_bench.cpp
+    ${ROOT}/src/main_omp.cpp
     codec_cpu.cpp
     ${SHARED_SRC}
 )
@@ -43,7 +43,7 @@ target_link_libraries(bench_omp PRIVATE OpenMP::OpenMP_CXX)
 
 # ── Serial (single-threaded) ─────────────────────────────
 add_executable(bench_serial
-    main_bench.cpp
+    ${ROOT}/src/main_serial.cpp
     codec_cpu.cpp
     ${SHARED_SRC}
 )
