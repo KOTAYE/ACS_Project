@@ -33,6 +33,7 @@ struct BinHeader {
     int32_t channels;
     int32_t quality;
     int32_t frame_count;
+    int32_t use_ycbcr = 1;
 };
 #pragma pack(pop)
 
@@ -75,7 +76,7 @@ void rle_decode_zeros(const std::vector<int16_t>& in, std::vector<int16_t>& out)
 }
 
 
-void compress_flipbook(const std::string& in_dir, const std::string& out_path, int quality) {
+void compress_flipbook(const std::string& in_dir, const std::string& out_path, int quality, bool use_ycbcr) {
     if (!fs::exists(in_dir) || !fs::is_directory(in_dir)) {
         std::cerr << "Input must be a valid directory containing frames.\n";
         return;
@@ -99,17 +100,18 @@ void compress_flipbook(const std::string& in_dir, const std::string& out_path, i
     header.width = img_w;   header.height = img_h;
     header.channels = img_ch; header.quality = quality;
     header.frame_count = static_cast<int32_t>(frames.size());
+    header.use_ycbcr = use_ycbcr ? 1 : 0;
     out.write(reinterpret_cast<const char*>(&header), sizeof(header));
 
     const QuantMatrix luma_qm   = make_quant_matrix(kJpegLumaQuant, quality);
     const QuantMatrix chroma_qm = make_quant_matrix(kJpegChromaQuant, quality);
 
-    cuda_alloc_frame_buffers(img_w, img_h, img_ch, luma_qm.data(), chroma_qm.data());
+    cuda_alloc_frame_buffers(img_w, img_h, img_ch, luma_qm.data(), chroma_qm.data(), use_ycbcr);
 
     int pw[3], ph[3];
     for (int ch = 0; ch < img_ch; ++ch) {
         int w = img_w, h = img_h;
-        if (ch > 0 && img_ch == 3) { w = (img_w+1)/2; h = (img_h+1)/2; }
+        if (use_ycbcr && ch > 0 && img_ch == 3) { w = (img_w+1)/2; h = (img_h+1)/2; }
         pw[ch] = codec_pad8(w);  ph[ch] = codec_pad8(h);
     }
 
@@ -119,6 +121,7 @@ void compress_flipbook(const std::string& in_dir, const std::string& out_path, i
     std::cout << "Compressing " << frames.size() << " frames into " << out_path << "...\n";
 
     std::future<uint8_t*> prefetch;
+    std::future<void> write_future;
 
     for (size_t f_idx = 0; f_idx < frames.size(); ++f_idx) {
         uint8_t* raw;
@@ -142,6 +145,13 @@ void compress_flipbook(const std::string& in_dir, const std::string& out_path, i
 
         bool is_keyframe = (f_idx == 0);
 
+        struct ChannelData {
+            uint32_t rle_bytes;
+            uint32_t enc_len;
+            std::vector<uint8_t> enc_data;
+        };
+        std::vector<ChannelData> frame_data(img_ch);
+
         for (int ch = 0; ch < img_ch; ++ch) {
             int total_blocks = (pw[ch] / 8) * (ph[ch] / 8);
             int samples = total_blocks * 64;
@@ -160,16 +170,29 @@ void compress_flipbook(const std::string& in_dir, const std::string& out_path, i
             int enc_len = huffman_encode_bytes(raw_bytes, raw_len, encoded.data(), encoded.size());
             if (enc_len < 0) { std::cerr << "\nHuffman overflow\n"; enc_len = 0; }
 
-            uint32_t rle_bytes = static_cast<uint32_t>(raw_len);
-            out.write(reinterpret_cast<const char*>(&rle_bytes), sizeof(rle_bytes));
-            uint32_t len32 = static_cast<uint32_t>(enc_len);
-            out.write(reinterpret_cast<const char*>(&len32), sizeof(len32));
-            if (enc_len > 0) out.write(reinterpret_cast<const char*>(encoded.data()), enc_len);
+            frame_data[ch].rle_bytes = static_cast<uint32_t>(raw_len);
+            frame_data[ch].enc_len = static_cast<uint32_t>(enc_len);
+            frame_data[ch].enc_data.assign(encoded.begin(), encoded.begin() + enc_len);
         }
 
         cuda_swap_recon();
+
+        if (write_future.valid()) write_future.get();
+
+        write_future = std::async(std::launch::async,
+            [&out, data = std::move(frame_data)]() {
+                for (auto& cd : data) {
+                    out.write(reinterpret_cast<const char*>(&cd.rle_bytes), sizeof(cd.rle_bytes));
+                    out.write(reinterpret_cast<const char*>(&cd.enc_len), sizeof(cd.enc_len));
+                    if (cd.enc_len > 0)
+                        out.write(reinterpret_cast<const char*>(cd.enc_data.data()), cd.enc_len);
+                }
+            });
+
         std::cout << "\r  Progress: " << f_idx + 1 << "/" << frames.size() << std::flush;
     }
+
+    if (write_future.valid()) write_future.get();
     std::cout << "\n  Finished compressing flipbook.\n";
     cuda_free_frame_buffers();
 }
@@ -188,20 +211,28 @@ void decompress_flipbook(const std::string& in_path, const std::string& out_dir)
 
     fs::create_directories(out_dir);
 
+    bool use_ycbcr = (header.use_ycbcr != 0);
+
     const QuantMatrix luma_qm   = make_quant_matrix(kJpegLumaQuant, header.quality);
     const QuantMatrix chroma_qm = make_quant_matrix(kJpegChromaQuant, header.quality);
 
     cuda_alloc_frame_buffers(header.width, header.height, header.channels,
-                             luma_qm.data(), chroma_qm.data());
+                             luma_qm.data(), chroma_qm.data(), use_ycbcr);
 
     int pw[3], ph[3];
     for (int ch = 0; ch < header.channels; ++ch) {
         int w = header.width, h = header.height;
-        if (ch > 0 && header.channels == 3) { w = (header.width+1)/2; h = (header.height+1)/2; }
+        if (use_ycbcr && ch > 0 && header.channels == 3) { w = (header.width+1)/2; h = (header.height+1)/2; }
         pw[ch] = codec_pad8(w);  ph[ch] = codec_pad8(h);
     }
 
-    std::vector<uint8_t> rgb_buf(static_cast<size_t>(header.width) * header.height * header.channels);
+    stbi_write_png_compression_level = 1;
+
+    constexpr int NUM_WRITE_BUFS = 4;
+    const size_t rgb_size = static_cast<size_t>(header.width) * header.height * header.channels;
+    std::vector<std::vector<uint8_t>> rgb_ring(NUM_WRITE_BUFS);
+    for (auto& buf : rgb_ring) buf.resize(rgb_size);
+    std::future<void> write_futures[NUM_WRITE_BUFS];
 
     std::vector<int16_t> channel_buffer;
     std::vector<uint8_t> encoded;
@@ -236,17 +267,30 @@ void decompress_flipbook(const std::string& in_path, const std::string& out_dir)
 
         cuda_sync_all();
 
-        cuda_download_and_convert_rgb(rgb_buf.data(), header.width, header.height, header.channels);
+        int slot = f_idx % NUM_WRITE_BUFS;
+
+        if (write_futures[slot].valid()) write_futures[slot].get();
+
+        cuda_download_and_convert_rgb(rgb_ring[slot].data(), header.width, header.height, header.channels);
 
         char filename[256];
         std::snprintf(filename, sizeof(filename), "/frame_%04d.png", f_idx);
         std::string fpath = out_dir + filename;
-        stbi_write_png(fpath.c_str(), header.width, header.height, header.channels,
-                       rgb_buf.data(), header.width * header.channels);
+        int w = header.width, h = header.height, ch_count = header.channels;
+        uint8_t* buf_ptr = rgb_ring[slot].data();
+
+        write_futures[slot] = std::async(std::launch::async,
+            [fpath, buf_ptr, w, h, ch_count]() {
+                stbi_write_png(fpath.c_str(), w, h, ch_count, buf_ptr, w * ch_count);
+            });
 
         std::cout << "\r  Progress: " << f_idx + 1 << "/" << header.frame_count << std::flush;
         cuda_swap_recon();
     }
+
+    for (int i = 0; i < NUM_WRITE_BUFS; ++i)
+        if (write_futures[i].valid()) write_futures[i].get();
+
     std::cout << "\n  Finished decompressing flipbook.\n";
     cuda_free_frame_buffers();
 }

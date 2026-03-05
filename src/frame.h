@@ -28,7 +28,7 @@
         }
     };
 
-    inline Frame frame_create(int width, int height, int channels) {
+    inline Frame frame_create(int width, int height, int channels, bool use_ycbcr = true) {
         Frame f;
         f.width = width;
         f.height = height;
@@ -36,8 +36,7 @@
         for (int ch = 0; ch < channels; ++ch) {
             int w = width;
             int h = height;
-            if (ch > 0 && channels == 3) {
-                // 4:2:0 Subsampling for Chroma
+            if (use_ycbcr && ch > 0 && channels == 3) {
                 w = (width + 1) / 2;
                 h = (height + 1) / 2;
             }
