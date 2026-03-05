@@ -86,7 +86,6 @@ void rle_decode_zeros(const std::vector<int16_t>& in, std::vector<int16_t>& out)
     }
 }
 
-// ── Convert RGB -> YCbCr or raw split (Parallel with OpenMP) ───────────────
 Frame rgb_to_planes_parallel(uint8_t* raw, int w, int h, int ch, bool use_ycbcr) {
     Frame f = frame_create(w, h, ch, use_ycbcr);
     if (use_ycbcr && ch >= 3) {
@@ -125,7 +124,6 @@ Frame rgb_to_planes_parallel(uint8_t* raw, int w, int h, int ch, bool use_ycbcr)
     return f;
 }
 
-// ── Convert YCbCr/raw planes -> RGB (Parallel with OpenMP) ────────────────
 void planes_to_rgb_parallel(const Frame& f, std::vector<uint8_t>& out_rgb, bool use_ycbcr) {
     int w = f.width;
     int h = f.height;
