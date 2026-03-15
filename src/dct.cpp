@@ -7,12 +7,16 @@
 #endif
 
 static float cos_table[8][8];
+static float cos_table16[16][16];
 static bool  lut_ready = false;
 
 void dct_init_lut() {
     for (int k = 0; k < 8; ++k)
         for (int n = 0; n < 8; ++n)
             cos_table[k][n] = std::cos(M_PI * (2.0 * n + 1.0) * k / 16.0);
+    for (int k = 0; k < 16; ++k)
+        for (int n = 0; n < 16; ++n)
+            cos_table16[k][n] = std::cos(M_PI * (2.0 * n + 1.0) * k / 32.0);
     lut_ready = true;
 }
 
@@ -116,4 +120,41 @@ void idct2d_separable(const float in[64], float out[64]) {
 
     for (int r = 0; r < 8; ++r)
         idct1d_row(tmp + r * 8, out + r * 8);
+}
+
+void dct2d_naive_16(const float in[256], float out[256]) {
+    for (int u = 0; u < 16; ++u) {
+        float cu = (u == 0) ? (1.0f / std::sqrt(2.0f)) : 1.0f;
+        for (int v = 0; v < 16; ++v) {
+            float cv = (v == 0) ? (1.0f / std::sqrt(2.0f)) : 1.0f;
+            float sum = 0.0f;
+            for (int y = 0; y < 16; ++y) {
+                for (int x = 0; x < 16; ++x) {
+                    sum += in[y * 16 + x]
+                           * cos_table16[u][y]
+                           * cos_table16[v][x];
+                }
+            }
+            out[u * 16 + v] = 0.25f * cu * cv * sum;
+        }
+    }
+}
+
+void idct2d_naive_16(const float in[256], float out[256]) {
+    for (int y = 0; y < 16; ++y) {
+        for (int x = 0; x < 16; ++x) {
+            float sum = 0.0f;
+            for (int u = 0; u < 16; ++u) {
+                float cu = (u == 0) ? (1.0f / std::sqrt(2.0f)) : 1.0f;
+                for (int v = 0; v < 16; ++v) {
+                    float cv = (v == 0) ? (1.0f / std::sqrt(2.0f)) : 1.0f;
+                    sum += cu * cv
+                           * in[u * 16 + v]
+                           * cos_table16[u][y]
+                           * cos_table16[v][x];
+                }
+            }
+            out[y * 16 + x] = 0.25f * sum;
+        }
+    }
 }

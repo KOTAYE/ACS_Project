@@ -1,0 +1,267 @@
+\documentclass[conference]{IEEEtran}
+%\IEEEoverridecommandlockouts
+% The preceding line is only needed to identify funding in the first footnote. If that is unneeded, please comment it out.
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{flushend} % Equalize last page, be careful -- it can break things!
+
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+
+\ifCLASSOPTIONcompsoc
+\usepackage[caption=false,font=normalsize,labelfont=sf,textfont=sf]{subfig}
+\else
+\usepackage[caption=false,font=footnotesize]{subfig}
+\fi
+
+\DeclareMathOperator{\f}{\textit{f}}
+
+\begin{document}
+
+\title{
+Development and Analysis of a DCT-Based Flipbook Compression Pipeline with Quantization and Huffman Coding
+}
+
+\author{
+    \IEEEauthorblockN{Artem Onyshchuk}
+    \IEEEauthorblockA{\textit{Faculty of Applied Sciences} \\
+    \textit{Ukrainian Catholic University}\\
+    Kozelnytska St 2a, L'viv, Ukraine  \\
+    a.onyshchuk.pn@ucu.edu.ua}
+    \and
+    \IEEEauthorblockN{Yarema Mykhasiak}
+    \IEEEauthorblockA{\textit{Faculty of Applied Sciences} \\
+    \textit{Ukrainian Catholic University}\\
+    Kozelnytska St 2a, L'viv, Ukraine  \\
+    mykhasiak.pn@ucu.edu.ua}
+    \and
+    \IEEEauthorblockN{Yulian Volodymyr Zaiats}
+    \IEEEauthorblockA{\textit{Faculty of Applied Sciences} \\
+    \textit{Ukrainian Catholic University}\\
+    L'viv, Ukraine \\
+    zaiats.pn@ucu.edu.ua}
+    \and
+    \IEEEauthorblockN{Viktor Syrotiuk}
+    \IEEEauthorblockA{\textit{Faculty of Applied Sciences} \\
+    \textit{Ukrainian Catholic University}\\
+    L'viv, Ukraine \\
+    syrotiuk.pn@ucu.edu.ua}
+    \and
+    \IEEEauthorblockN{Denys Maletskyy}
+    \IEEEauthorblockA{\textit{Graphics Engineer, Zibra AI} \\
+    Lviv, Ukraine \\
+    maletsden@gmail.com}
+}
+
+\maketitle
+
+\begin{abstract}
+This work presents a JPEG-like compression pipeline designed for flipbooks (short sequences of frames) and intended for future GPU acceleration. The method operates on $8\times 8$ blocks and consists of level shifting, two-dimensional discrete cosine transform (DCT), coefficient quantization and lossless entropy coding. For entropy coding, we use run-length encoding of zeros followed by Huffman coding. Reconstruction quality is evaluated using mean squared error (MSE) and peak signal-to-noise ratio (PSNR). Experiments show that the transform and entropy-coding stages are effectively lossless in practice under minimal quantization (PSNR $\approx 60.9\,\mathrm{dB}$ on the test content), while stronger quantization provides a clear trade-off between compression ratio and visual quality. The project also includes a CUDA-based backend that accelerates dense numerical stages (color conversion, block transforms and quantization), while entropy coding and container I/O remain on the CPU.
+\end{abstract}
+
+\begin{IEEEkeywords}
+flipbook compression, image compression, DCT, quantization, Huffman coding, GPU, CUDA.
+\end{IEEEkeywords}
+
+\section{Introduction}
+
+The goal of this course project is to develop and implement a high-performance compression and decompression algorithm for flipbooks using CUDA parallel computing. Target requirements include a compression ratio of approximately $10\times$ or higher, reconstructed quality with PSNR above $20\,\mathrm{dB}$, and decompression speed of at least 60 FPS for a target resolution.
+
+Our approach follows classical transform-based compression used in JPEG-like systems: each frame is split into $8\times 8$ blocks, transformed to the frequency domain using the discrete cosine transform (DCT), quantized to reduce precision, and then encoded with a lossless entropy coder. This structure is naturally parallel: blocks can be processed independently, which makes the algorithm suitable for GPU execution.
+
+\section{Pipeline Overview}
+
+A flipbook is represented as a sequence of RGB frames. Each frame is padded to multiples of 8 and then processed in non-overlapping $8\times 8$ blocks. To reduce redundancy in color channels, frames are converted to YCbCr, with $4{:}2{:}0$ chroma subsampling applied to chroma planes. The high-level compression pipeline for each plane is:
+\begin{enumerate}[leftmargin=*]
+    \item level shift (centering values around zero);
+    \item forward $8\times 8$ DCT to obtain frequency coefficients;
+    \item coefficient quantization controlled by a quality parameter;
+    \item zig-zag scan, run-length encoding (RLE) of zeros, and Huffman entropy coding.
+\end{enumerate}
+Decompression applies the inverse steps in reverse order and finishes with YCbCr to RGB conversion. In addition, for inter-frames we use a simple prediction model based on the previous reconstructed frame, while the first frame is treated as a keyframe.
+
+\section{Mathematical Background}
+
+\subsection{Level Shift and Block Structure}
+
+Let $I$ be a single-channel image defined on a padded grid
+\[
+I : \{0,\dots,W-1\}\times\{0,\dots,H-1\}\to\{0,\dots,255\}.
+\]
+The image is partitioned into $8\times 8$ blocks $X_{p,q}(x,y)$. Before applying the DCT we shift pixel values by
+\begin{equation}
+X'(x,y) = X(x,y) - 128.
+\label{eq:shift}
+\end{equation}
+
+\subsection{Two-Dimensional DCT and IDCT}
+
+We use DCT-II with normalization factors
+\begin{equation}
+\alpha(k) =
+\begin{cases}
+\dfrac{1}{\sqrt{2}}, & k=0,\\[0.3em]
+1, & k\neq 0,
+\end{cases}
+\label{eq:alpha}
+\end{equation}
+for $k\in\{0,\dots,7\}$.
+
+The forward transform of a block $X'(x,y)$ into coefficients $C(u,v)$ is
+\begin{equation}
+\begin{split}
+C(u,v) &= \alpha(u)\alpha(v)
+\sum_{x=0}^{7}\sum_{y=0}^{7} X'(x,y)\,
+\cos\left(\frac{(2x+1)u\pi}{16}\right) \\
+&\quad\cdot
+\cos\left(\frac{(2y+1)v\pi}{16}\right),
+\end{split}
+\label{eq:dct}
+\end{equation}
+where $u,v\in\{0,\dots,7\}$. The formula is written in a split form to fit the IEEE two-column layout.
+
+The inverse DCT reconstructs an approximation $\widehat{X}'(x,y)$:
+\begin{equation}
+\begin{split}
+\widehat{X}'(x,y) &= \frac{1}{4}\sum_{u=0}^{7}\sum_{v=0}^{7}
+\alpha(u)\alpha(v)\,C(u,v)\,
+\cos\left(\frac{(2x+1)u\pi}{16}\right) \\
+&\quad\cdot
+\cos\left(\frac{(2y+1)v\pi}{16}\right).
+\end{split}
+\label{eq:idct}
+\end{equation}
+
+Finally, inverse level shift is applied:
+\begin{equation}
+\widehat{X}(x,y) = \widehat{X}'(x,y) + 128.
+\label{eq:invshift}
+\end{equation}
+
+\subsection{Quantization}
+
+Quantization is the main lossy step and controls both bitrate and quality. Let $q_{u,v}>0$ be the quantization value for coefficient $(u,v)$ derived from a base table and a user-specified quality parameter. The quantized coefficient is
+\begin{equation}
+\widetilde{C}(u,v) = \mathrm{round}\left(\frac{C(u,v)}{q_{u,v}}\right),
+\label{eq:quant}
+\end{equation}
+and dequantization reconstructs
+\begin{equation}
+\widehat{C}(u,v) = q_{u,v}\,\widetilde{C}(u,v).
+\label{eq:dequant}
+\end{equation}
+
+\subsection{Entropy Coding (RLE + Huffman)}
+
+After quantization, many coefficients (especially high-frequency ones) become zero. We exploit this by applying a zig-zag scan and run-length encoding (RLE) of consecutive zeros. The RLE output is then entropy-coded using Huffman coding.
+
+Let the RLE output be a sequence of integers, represented as a byte stream $b_0,\dots,b_{M-1}\in\{0,\dots,255\}$. We estimate symbol frequencies
+\begin{equation}
+f(k) = \bigl|\{j \mid b_j = k\}\bigr|,\quad k\in\{0,\dots,255\},
+\label{eq:freq}
+\end{equation}
+build a Huffman tree using the standard greedy algorithm, and encode the stream into a header (frequency table) and a bitstream
+\begin{equation}
+B = h(b_0)\,\Vert\,h(b_1)\,\Vert\,\dots\,\Vert\,h(b_{M-1}),
+\label{eq:bitstream}
+\end{equation}
+where $h(\cdot)$ denotes symbol codewords.
+
+\section{CUDA-Based Design}
+
+The project includes a CUDA-based backend intended to accelerate the most computationally intensive stages of the pipeline. GPU kernels are used for dense numerical operations:
+\begin{itemize}[leftmargin=*]
+  \item color-space conversion between RGB and YCbCr with $4{:}2{:}0$ chroma subsampling;
+  \item block-wise forward and inverse DCT for all $8\times 8$ blocks;
+  \item coefficient (de)quantization and simple inter-frame prediction using the previous reconstructed frame.
+\end{itemize}
+Entropy coding (RLE + Huffman), bitstream/container I/O, and file system operations are executed on the CPU. This division is chosen because entropy coding typically has irregular control flow and data-dependent branching, while transform and quantization stages are uniform and highly parallel.
+
+\section{Experimental Setup}
+
+\subsection{Quality Metrics}
+
+For a frame with $N$ pixels per channel, let $x_i$ and $\widehat{x}_i$ be original and reconstructed values, respectively. The mean squared error is
+\begin{equation}
+\mathrm{MSE} = \frac{1}{N}\sum_{i=1}^{N}(x_i-\widehat{x}_i)^2.
+\label{eq:mse}
+\end{equation}
+For 8-bit images, with maximum value $I_{\max}=255$, the PSNR is
+\begin{equation}
+\mathrm{PSNR} = 10\log_{10}\left(\frac{I_{\max}^2}{\mathrm{MSE}}\right)\ \mathrm{dB}.
+\label{eq:psnr}
+\end{equation}
+
+\subsection{Evaluation Protocol}
+
+Frames are compressed and decompressed using a range of quality parameters. For each setting, reconstruction quality is evaluated using MSE and PSNR. Compression efficiency is evaluated by the compression ratio
+\[
+\text{ratio} = \frac{\text{input bytes}}{\text{compressed bytes}}.
+\]
+Performance is measured as decompression throughput in frames per second (FPS) for target resolutions, where hardware support is available.
+
+\section{Results}
+
+For a representative test image under minimal quantization (near-lossless setting), we obtain:
+\[
+\mathrm{MSE} \approx 0.0531,\quad \mathrm{PSNR} \approx 60.88\,\mathrm{dB}.
+\]
+This indicates that the transform and entropy-coding stages are effectively lossless in practice, and the remaining error is dominated by rounding and finite-precision effects.
+
+For stronger quantization, the number of zeros in quantized coefficient blocks increases, improving entropy coding efficiency and increasing the compression ratio. At the same time, PSNR decreases and visual artifacts become more noticeable. This behavior matches the expected trade-off of transform-based compression.
+
+\subsection{Preliminary Performance Comparison}
+
+To study execution time on flipbooks, the codec was applied to a sequence of 650 frames. Three implementations were compared on the same hardware configuration:
+\begin{itemize}[leftmargin=*]
+  \item a single-threaded CPU backend,
+  \item a multi-threaded CPU backend using OpenMP,
+  \item a GPU-accelerated backend where color conversion, block transforms and quantization are executed on the GPU.
+\end{itemize}
+
+The approximate wall-clock times for compressing the 650-frame sequence were:
+\begin{itemize}[leftmargin=*]
+  \item single-threaded CPU: about 20 seconds,
+  \item OpenMP-accelerated CPU: about 14 seconds,
+  \item CUDA-based backend: about 7 seconds.
+\end{itemize}
+
+These preliminary results indicate that parallelization on the CPU already provides a noticeable speedup, while the current CUDA-based implementation roughly doubles the throughput compared to the OpenMP version. At the same time, the overall performance is still limited by algorithmic bottlenecks in entropy coding and container I/O, which motivates further optimization.
+
+\section{Discussion and Remaining Work}
+
+The current state of the project includes a complete transform-based pipeline (DCT, quantization, RLE and Huffman coding) and a CUDA-based design that accelerates dense numerical stages on the GPU. The main remaining tasks to fully satisfy the course goals are:
+\begin{itemize}[leftmargin=*]
+  \item systematic benchmarking of compression ratio, PSNR (and SSIM) across different types of flipbook content;
+  \item more detailed performance benchmarking of CPU and GPU backends, including decompression throughput (FPS) for target resolutions and flipbook lengths on CUDA-capable hardware;
+  \item optimization of GPU kernels (memory access patterns, shared memory usage, kernel configuration);
+  \item improving inter-frame compression by exploring stronger temporal prediction models.
+\end{itemize}
+
+\section{Conclusion}
+
+We presented a DCT-based compression pipeline for flipbooks with quantization and Huffman entropy coding. The method demonstrates the expected quality--compression trade-off and achieves near-lossless reconstruction under minimal quantization. The block-wise structure is naturally parallel, and the project includes a CUDA-based backend that accelerates the main numerical stages, providing a foundation for future performance tuning toward real-time decompression.
+
+\begin{thebibliography}{99}
+
+\bibitem{wallace}
+G.~K. Wallace, ``The JPEG still picture compression standard,'' \emph{Communications of the ACM}, vol.~34, no.~4, pp.~30--44, 1991.
+
+\bibitem{rao}
+K.~R. Rao and P.~Yip, \emph{Discrete Cosine Transform: Algorithms, Advantages, Applications}. Academic Press, 1990.
+
+\bibitem{huffman}
+D.~A. Huffman, ``A method for the construction of minimum-redundancy codes,'' \emph{Proceedings of the IRE}, vol.~40, no.~9, pp.~1098--1101, 1952.
+
+\bibitem{gonzalez}
+R.~C. Gonzalez and R.~E. Woods, \emph{Digital Image Processing}, 4th~ed. Pearson, 2018.
+
+\end{thebibliography}
+
+\end{document}
+

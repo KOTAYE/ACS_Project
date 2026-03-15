@@ -118,6 +118,11 @@ void compress_flipbook(const std::string& in_dir, const std::string& out_path, i
     std::vector<int16_t> channel_buffer;
     std::vector<uint8_t> encoded;
 
+    uint64_t total_raw_bytes = 0;
+    uint64_t total_rle_bytes = 0;
+    uint64_t total_huff_bytes = 0;
+    uint64_t total_huff_only_bytes = 0;
+
     std::cout << "Compressing " << frames.size() << " frames into " << out_path << "...\n";
 
     std::future<uint8_t*> prefetch;
@@ -160,6 +165,9 @@ void compress_flipbook(const std::string& in_dir, const std::string& out_path, i
             cuda_encode_channel(ch, channel_buffer.data(), pw[ch], ph[ch], is_keyframe);
             cuda_sync_channel(ch);
 
+            const int raw_coeff_bytes = samples * static_cast<int>(sizeof(int16_t));
+            total_raw_bytes += static_cast<uint64_t>(raw_coeff_bytes);
+
             std::vector<int16_t> rle_in(channel_buffer.begin(), channel_buffer.begin() + samples);
             std::vector<int16_t> rle_buf = rle_encode_zeros(rle_in);
             const uint8_t* raw_bytes = reinterpret_cast<const uint8_t*>(rle_buf.data());
@@ -169,6 +177,17 @@ void compress_flipbook(const std::string& in_dir, const std::string& out_path, i
 
             int enc_len = huffman_encode_bytes(raw_bytes, raw_len, encoded.data(), encoded.size());
             if (enc_len < 0) { std::cerr << "\nHuffman overflow\n"; enc_len = 0; }
+
+            total_rle_bytes  += static_cast<uint64_t>(raw_len);
+            total_huff_bytes += static_cast<uint64_t>(enc_len);
+
+            // Huffman without RLE: encode raw coefficients as bytes
+            const uint8_t* coeff_bytes = reinterpret_cast<const uint8_t*>(channel_buffer.data());
+            const int coeff_len = raw_coeff_bytes;
+            if (encoded.size() < coeff_len + 1024) encoded.resize(coeff_len + 1024);
+            int enc_len_raw = huffman_encode_bytes(coeff_bytes, coeff_len, encoded.data(), encoded.size());
+            if (enc_len_raw < 0) enc_len_raw = 0;
+            total_huff_only_bytes += static_cast<uint64_t>(enc_len_raw);
 
             frame_data[ch].rle_bytes = static_cast<uint32_t>(raw_len);
             frame_data[ch].enc_len = static_cast<uint32_t>(enc_len);
@@ -193,7 +212,25 @@ void compress_flipbook(const std::string& in_dir, const std::string& out_path, i
     }
 
     if (write_future.valid()) write_future.get();
+
     std::cout << "\n  Finished compressing flipbook.\n";
+
+    if (total_raw_bytes > 0) {
+        double raw_mb   = static_cast<double>(total_raw_bytes) / (1024.0 * 1024.0);
+        double rle_mb   = static_cast<double>(total_rle_bytes) / (1024.0 * 1024.0);
+        double huff_mb  = static_cast<double>(total_huff_bytes) / (1024.0 * 1024.0);
+        double huffo_mb = static_cast<double>(total_huff_only_bytes) / (1024.0 * 1024.0);
+
+        std::cout << "Entropy statistics over all channels and frames:\n";
+        std::cout << "  Raw coeffs       : " << raw_mb   << " MiB (100%)\n";
+        std::cout << "  RLE only         : " << rle_mb   << " MiB ("
+                  << (100.0 * rle_mb  / raw_mb)   << "%)\n";
+        std::cout << "  Huffman only     : " << huffo_mb << " MiB ("
+                  << (100.0 * huffo_mb / raw_mb) << "%)\n";
+        std::cout << "  RLE + Huffman    : " << huff_mb  << " MiB ("
+                  << (100.0 * huff_mb / raw_mb)  << "%)\n";
+    }
+
     cuda_free_frame_buffers();
 }
 
