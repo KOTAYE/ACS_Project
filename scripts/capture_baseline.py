@@ -1,17 +1,12 @@
 #!/usr/bin/env python3
-                      
-                      
-"""
-Знімає baseline продуктивності flipbook_cuda (compress + decompress) для порівняння після оптимізацій.
-
-Парсить рядки [BENCHMARK] з stdout і зберігає JSON у baseline/runs/.
-"""
+"""Capture flipbook_cuda compress/decompress baseline to baseline/runs/."""
 from __future__ import annotations
 
 import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -140,8 +135,6 @@ def main() -> int:
     if tmp_bin.exists():
         tmp_bin.unlink()
     if tmp_recon.exists():
-        import shutil
-
         shutil.rmtree(tmp_recon, ignore_errors=True)
 
     record = {

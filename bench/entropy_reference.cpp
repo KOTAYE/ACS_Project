@@ -1,6 +1,3 @@
-
-
-
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -17,29 +14,9 @@
 #include "image_io.h"
 #include "quant.h"
 #include "tiling.h"
-#include "zigzag.h"
+#include "rle.h"
 
 namespace fs = std::filesystem;
-
-static std::vector<int16_t> rle_encode_zeros_vec(const std::vector<int16_t>& in) {
-    std::vector<int16_t> out;
-    out.reserve(in.size() / 2);
-    int i = 0;
-    const int n = static_cast<int>(in.size());
-    while (i < n) {
-        if (in[i] == 0) {
-            int run = 1;
-            while (i + run < n && in[i + run] == 0 && run < 32767) run++;
-            out.push_back(0);
-            out.push_back(static_cast<int16_t>(run));
-            i += run;
-        } else {
-            out.push_back(in[i]);
-            i++;
-        }
-    }
-    return out;
-}
 
 struct ChannelStats {
     std::string label;
@@ -147,7 +124,7 @@ static void process_frame_like_codec(const Frame& current, Frame& prev_recon, Fr
             }
         }
 
-        std::vector<int16_t> rle = rle_encode_zeros_vec(channel_buffer);
+        std::vector<int16_t> rle = rle_encode_zeros(channel_buffer);
         const uint8_t* rle_u8 = reinterpret_cast<const uint8_t*>(rle.data());
         const int rle_len = static_cast<int>(rle.size() * sizeof(int16_t));
 
@@ -180,8 +157,8 @@ static void process_frame_like_codec(const Frame& current, Frame& prev_recon, Fr
 
 static void print_report(const std::string& title, std::vector<ChannelStats>& acc) {
     std::cout << "\n=== " << title << " ===\n";
-    std::cout << "RLE = run-length нулів після квантування (int16 → байти). Huffman = еталон CPU (як flipbook_omp).\n";
-    std::cout << "Order0-ideal = 512 + ceil(H/8) (як блок частот Huffman). AC(actual) = range code, заголовок 520 B (ARQ0).\n\n";
+    std::cout << "RLE = zero runs after quant (int16). Huffman = CPU reference (flipbook_omp).\n";
+    std::cout << "Order0-ideal = 512 + ceil(H/8) (Huffman freq block). AC(actual) = range code, 520 B header (ARQ0).\n\n";
     std::cout << "channel | raw_coef | RLE     | Huffman | Order0-ideal | AC(actual) | Huff/raw | Ideal/raw | AC/raw\n";
     int64_t t_raw = 0, t_rle = 0, t_h = 0, t_a = 0, t_ac = 0;
     for (auto& c : acc) {
@@ -276,7 +253,7 @@ int main(int argc, char** argv) {
         if (input_dir.empty()) {
             std::cerr << "Usage: entropy_reference [--self-test] [DIR] [-q Q] [-b B] [-n NFRAMES]\n"
                       << "       entropy_reference --mode normals|depth [-q Q] [-b B]\n"
-                      << "  Порівнює: raw, RLE, Huffman, межа order-0 AC, фактичний AC (range code).\n";
+                      << "  Compares raw, RLE, Huffman, order-0 bound, and range-coded AC.\n";
             return 1;
         }
         std::vector<std::string> frames;

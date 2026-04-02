@@ -33,3 +33,5 @@ QuantMatrix make_quant_matrix(const QuantMatrix8& base, int quality, int block_s
 
 void quantize_block  (float* block, const QuantMatrix& qm, int size);
 void dequantize_block(float* block, const QuantMatrix& qm, int size);
+
+std::vector<int> codec_zigzag_scan_table(int block_size);

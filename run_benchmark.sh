@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
@@ -6,66 +6,62 @@ cd "$ROOT"
 
 REL_INPUT="${1:-Frames}"
 if [[ "$REL_INPUT" = /* ]]; then
-    FRAMES_DIR="$REL_INPUT"
+  FRAMES_DIR="$REL_INPUT"
 else
-    FRAMES_DIR="$ROOT/$REL_INPUT"
+  FRAMES_DIR="$ROOT/$REL_INPUT"
 fi
 
 if [[ ! -d "$FRAMES_DIR" ]]; then
-    if [[ "${1:-}" == "frames_cuda" ]] && [[ -d "$ROOT/Frames" ]]; then
-        echo "Каталог frames_cuda/ не знайдено (наприклад, після прибирання репозиторію). Використовую Frames/."
-        FRAMES_DIR="$ROOT/Frames"
-    else
-        echo "Помилка: немає каталогу з кадрами: $FRAMES_DIR"
-        echo "Створіть його або передайте шлях: $0 /шлях/до/png"
-        exit 1
-    fi
+  echo "error: frames directory not found: $FRAMES_DIR"
+  echo "usage: $0 [path/to/frames]"
+  exit 1
 fi
 
 if ! find "$FRAMES_DIR" -maxdepth 1 \( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.exr' \) -print -quit | grep -q .; then
-    echo "Помилка: у $FRAMES_DIR немає PNG/JPEG/EXR файлів (перевірте шлях)."
-    exit 1
+  echo "error: no PNG/JPEG/EXR in $FRAMES_DIR"
+  exit 1
 fi
 
-BUILD_DIR="build"
-RESULTS_DIR="benchmark_results"
+BUILD="${BUILD_DIR:-build}"
+RESULTS_DIR="${BENCHMARK_RESULTS_DIR:-$ROOT/benchmark_results}"
+CHARTS_DIR="${CHARTS_DIR:-$ROOT/charts}"
+
+echo "=== Build ==="
+cmake -S "$ROOT" -B "$BUILD" -DCMAKE_BUILD_TYPE=Release
+cmake --build "$BUILD" -j"$(nproc 2>/dev/null || echo 4)"
+
+EXE_CUDA="$BUILD/flipbook_cuda"
+EXE_OMP="$BUILD/flipbook_omp"
 
 mkdir -p "$RESULTS_DIR"
-
-echo "=== Building project ==="
-mkdir -p "$BUILD_DIR"
-cd "$BUILD_DIR"
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j$(nproc)
-cd ..
+rm -f "$RESULTS_DIR"/gpu_compress_q*.log "$RESULTS_DIR"/gpu_decompress_q*.log \
+      "$RESULTS_DIR"/cpu_compress_q*.log "$RESULTS_DIR"/cpu_decompress_q*.log
 
 echo ""
-echo "=== Running GPU benchmarks ==="
+echo "=== GPU benchmarks ==="
 for Q in 10 20 30 40 50 60 70 80 90 100; do
-    OUT_BIN="$RESULTS_DIR/gpu_q${Q}.bin"
-    OUT_DIR="$RESULTS_DIR/gpu_q${Q}_recon"
-    echo "--- GPU quality=$Q ---"
-    ./$BUILD_DIR/flipbook_cuda compress -q $Q "$FRAMES_DIR" "$OUT_BIN" 2>&1 | tee "$RESULTS_DIR/gpu_compress_q${Q}.log"
-    ./$BUILD_DIR/flipbook_cuda decompress "$OUT_BIN" "$OUT_DIR" 2>&1 | tee "$RESULTS_DIR/gpu_decompress_q${Q}.log"
+  BIN="$RESULTS_DIR/_gpu_q${Q}.bin"
+  RECON="$RESULTS_DIR/gpu_q${Q}_recon"
+  echo "--- GPU q=$Q ---"
+  "$EXE_CUDA" compress -q "$Q" "$FRAMES_DIR" "$BIN" 2>&1 | tee "$RESULTS_DIR/gpu_compress_q${Q}.log"
+  "$EXE_CUDA" decompress "$BIN" "$RECON" 2>&1 | tee "$RESULTS_DIR/gpu_decompress_q${Q}.log"
+  rm -f "$BIN"
 done
 
 echo ""
-echo "=== Running CPU (OpenMP) benchmarks ==="
+echo "=== CPU (OpenMP) benchmarks ==="
 for Q in 10 20 30 40 50 60 70 80 90 100; do
-    OUT_BIN="$RESULTS_DIR/cpu_q${Q}.bin"
-    OUT_DIR="$RESULTS_DIR/cpu_q${Q}_recon"
-    echo "--- CPU quality=$Q ---"
-    ./$BUILD_DIR/flipbook_omp compress -q $Q "$FRAMES_DIR" "$OUT_BIN" 2>&1 | tee "$RESULTS_DIR/cpu_compress_q${Q}.log"
-    ./$BUILD_DIR/flipbook_omp decompress "$OUT_BIN" "$OUT_DIR" 2>&1 | tee "$RESULTS_DIR/cpu_decompress_q${Q}.log"
+  BIN="$RESULTS_DIR/_cpu_q${Q}.bin"
+  RECON="$RESULTS_DIR/cpu_q${Q}_recon"
+  echo "--- CPU q=$Q ---"
+  "$EXE_OMP" compress -q "$Q" "$FRAMES_DIR" "$BIN" 2>&1 | tee "$RESULTS_DIR/cpu_compress_q${Q}.log"
+  "$EXE_OMP" decompress "$BIN" "$RECON" 2>&1 | tee "$RESULTS_DIR/cpu_decompress_q${Q}.log"
+  rm -f "$BIN"
 done
 
 echo ""
-echo "=== Computing PSNR and SSIM ==="
-python3 scripts/compute_metrics.py "$FRAMES_DIR" "$RESULTS_DIR"
+echo "=== Metrics and charts ==="
+python3 "$ROOT/scripts/compute_metrics.py" "$FRAMES_DIR" "$RESULTS_DIR"
+python3 "$ROOT/scripts/generate_real_charts.py" "$RESULTS_DIR" --charts-dir "$CHARTS_DIR"
 
-echo ""
-echo "=== Generating charts ==="
-python3 scripts/generate_real_charts.py "$RESULTS_DIR"
-
-echo ""
-echo "=== Done! Charts saved in charts/ ==="
+echo "Done. Charts: $CHARTS_DIR/  Metrics: $RESULTS_DIR/metrics.json"

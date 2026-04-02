@@ -47,12 +47,6 @@ void cuda_init_dct_constants() {
     CUDA_CHECK(cudaMemcpyToSymbol(c_cos32, h_cos32, sizeof(h_cos32)));
 }
 
-
-
-
-
-
-
 template<int BS>
 __device__ __forceinline__ float get_cos(int k, int n) {
     if constexpr (BS == 8) return c_cos8[k * 8 + n];
@@ -278,7 +272,7 @@ __global__ void decode_blocks_kernel(
 struct GpuChannel {
     int pw, ph, pixels;
     uint8_t *d_prev, *d_curr;
-    uint8_t *d_src_ping[2];
+    uint8_t *d_src;
     int16_t *d_coeff;
 
     uint8_t*  d_packed;
@@ -296,20 +290,15 @@ struct GpuChannel {
 static constexpr int MAX_CH = 3;
 static GpuChannel   g_ch[MAX_CH];
 static cudaStream_t g_stream[MAX_CH] = {};
-static cudaStream_t g_transfer_stream = nullptr;
 static float*       g_d_qm[2]       = {};
 static int*         g_d_zigzag      = nullptr;
 static int          g_num_ch         = 0;
 static bool         g_allocated      = false;
 
 static int g_bs = 8;
-static int g_pw[MAX_CH] = {}, g_ph[MAX_CH] = {};
 
-static uint8_t* g_h_rgb_in  = nullptr;
 static uint8_t* g_h_rgb_out = nullptr;
 static size_t   g_total_bytes = 0;
-static cudaEvent_t g_evt_h2d_done[2]         = {};
-static cudaEvent_t g_evt_encode_slot_done[2] = {};
 
 static inline int pad_bs(int n, int bs) { return ((n + bs - 1) / bs) * bs; }
 
@@ -320,7 +309,6 @@ void cuda_init() {
     CUDA_CHECK(cudaSetDevice(0));
     for (int i = 0; i < MAX_CH; ++i)
         CUDA_CHECK(cudaStreamCreate(&g_stream[i]));
-    CUDA_CHECK(cudaStreamCreate(&g_transfer_stream));
 }
 
 void cuda_cleanup() {
@@ -328,7 +316,6 @@ void cuda_cleanup() {
     rle_gpu_cleanup();
     for (int i = 0; i < MAX_CH; ++i)
         if (g_stream[i]) { cudaStreamDestroy(g_stream[i]); g_stream[i] = nullptr; }
-    if (g_transfer_stream) { cudaStreamDestroy(g_transfer_stream); g_transfer_stream = nullptr; }
 }
 
 void cuda_alloc_frame_buffers(int width, int height, int channels,
@@ -350,8 +337,7 @@ void cuda_alloc_frame_buffers(int width, int height, int channels,
         g_total_bytes += g_ch[i].pixels;
         
         size_t bytes = g_ch[i].pixels * sizeof(uint8_t);
-        CUDA_CHECK(cudaMalloc(&g_ch[i].d_src_ping[0], bytes));
-        CUDA_CHECK(cudaMalloc(&g_ch[i].d_src_ping[1], bytes));
+        CUDA_CHECK(cudaMalloc(&g_ch[i].d_src, bytes));
         CUDA_CHECK(cudaMalloc(&g_ch[i].d_prev, bytes));
         CUDA_CHECK(cudaMalloc(&g_ch[i].d_curr, bytes));
         CUDA_CHECK(cudaMemset(g_ch[i].d_prev, 0, bytes));
@@ -379,13 +365,7 @@ void cuda_alloc_frame_buffers(int width, int height, int channels,
     CUDA_CHECK(cudaMalloc(&g_d_zigzag, total_coeffs_per_block*sizeof(int)));
     CUDA_CHECK(cudaMemcpy(g_d_zigzag, zigzag, total_coeffs_per_block*sizeof(int), cudaMemcpyHostToDevice));
 
-    CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&g_h_rgb_in),  2 * g_total_bytes, cudaHostAllocDefault));
     CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&g_h_rgb_out), g_total_bytes, cudaHostAllocDefault));
-
-    for (int s = 0; s < 2; ++s) {
-        CUDA_CHECK(cudaEventCreateWithFlags(&g_evt_h2d_done[s], cudaEventDisableTiming));
-        CUDA_CHECK(cudaEventCreateWithFlags(&g_evt_encode_slot_done[s], cudaEventDisableTiming));
-    }
 
     g_allocated = true;
 }
@@ -393,7 +373,7 @@ void cuda_alloc_frame_buffers(int width, int height, int channels,
 void cuda_free_frame_buffers() {
     if (!g_allocated) return;
     for (int i = 0; i < g_num_ch; ++i) {
-        cudaFree(g_ch[i].d_src_ping[0]); cudaFree(g_ch[i].d_src_ping[1]);
+        cudaFree(g_ch[i].d_src);
         cudaFree(g_ch[i].d_prev);
         cudaFree(g_ch[i].d_curr);
         cudaFree(g_ch[i].d_coeff);
@@ -407,47 +387,28 @@ void cuda_free_frame_buffers() {
     rle_gpu_cleanup();
     for (auto& p : g_d_qm) { cudaFree(p); p = nullptr; }
     if (g_d_zigzag) { cudaFree(g_d_zigzag); g_d_zigzag = nullptr; }
-    if (g_h_rgb_in)  { cudaFreeHost(g_h_rgb_in);  g_h_rgb_in  = nullptr; }
     if (g_h_rgb_out) { cudaFreeHost(g_h_rgb_out); g_h_rgb_out = nullptr; }
-    for (int s = 0; s < 2; ++s) {
-        if (g_evt_h2d_done[s])         { cudaEventDestroy(g_evt_h2d_done[s]);         g_evt_h2d_done[s]         = {}; }
-        if (g_evt_encode_slot_done[s]) { cudaEventDestroy(g_evt_encode_slot_done[s]); g_evt_encode_slot_done[s] = {}; }
-    }
     g_allocated = false;
 }
 
-void cuda_submit_frame_h2d(int frame_index, const uint8_t* ptr[3], int channels) {
-    const int slot = frame_index % 2;
-    
-    if (frame_index >= 2)
-        CUDA_CHECK(cudaStreamWaitEvent(g_transfer_stream, g_evt_encode_slot_done[slot]));
-
-    uint8_t* pin_slot = g_h_rgb_in + slot * g_total_bytes;
-    size_t offset = 0;
+void cuda_upload_frame(const uint8_t* ptr[3], int channels) {
     for (int ch = 0; ch < channels; ++ch) {
-        size_t bytes = g_ch[ch].pixels * sizeof(uint8_t);
-        std::memcpy(pin_slot + offset, ptr[ch], bytes);
-        CUDA_CHECK(cudaMemcpyAsync(g_ch[ch].d_src_ping[slot], pin_slot + offset, bytes,
-                                   cudaMemcpyHostToDevice, g_transfer_stream));
-        offset += bytes;
+        const size_t bytes = static_cast<size_t>(g_ch[ch].pixels) * sizeof(uint8_t);
+        CUDA_CHECK(cudaMemcpy(g_ch[ch].d_src, ptr[ch], bytes, cudaMemcpyHostToDevice));
     }
-    CUDA_CHECK(cudaEventRecord(g_evt_h2d_done[slot], g_transfer_stream));
 }
 
 void cuda_download_planes(uint8_t* ptr[3], int channels) {
-    
     CUDA_CHECK(cudaDeviceSynchronize());
     size_t offset = 0;
     for (int ch = 0; ch < channels; ++ch) {
-        size_t bytes = g_ch[ch].pixels * sizeof(uint8_t);
-        CUDA_CHECK(cudaMemcpyAsync(g_h_rgb_out + offset, g_ch[ch].d_curr, bytes,
-                                   cudaMemcpyDeviceToHost, g_transfer_stream));
+        const size_t bytes = static_cast<size_t>(g_ch[ch].pixels) * sizeof(uint8_t);
+        CUDA_CHECK(cudaMemcpy(g_h_rgb_out + offset, g_ch[ch].d_curr, bytes, cudaMemcpyDeviceToHost));
         offset += bytes;
     }
-    CUDA_CHECK(cudaStreamSynchronize(g_transfer_stream));
     offset = 0;
     for (int ch = 0; ch < channels; ++ch) {
-        size_t bytes = g_ch[ch].pixels * sizeof(uint8_t);
+        const size_t bytes = static_cast<size_t>(g_ch[ch].pixels) * sizeof(uint8_t);
         std::memcpy(ptr[ch], g_h_rgb_out + offset, bytes);
         offset += bytes;
     }
@@ -459,14 +420,12 @@ void cuda_download_coeffs(int ch, int16_t* host_dst, int num_coeffs) {
                           cudaMemcpyDeviceToHost));
 }
 
-void cuda_encode_channel(int ch, int pw, int ph, int block_size, bool is_keyframe, int src_slot) {
+void cuda_encode_channel(int ch, int pw, int ph, int block_size, bool is_keyframe) {
     auto& buf    = g_ch[ch];
     auto  stream = g_stream[ch];
     const float* qm = (ch == 0) ? g_d_qm[0] : g_d_qm[1];
-    const int s = src_slot & 1;
-    CUDA_CHECK(cudaStreamWaitEvent(stream, g_evt_h2d_done[s]));
 
-    uint8_t* d_src = buf.d_src_ping[s];
+    uint8_t* d_src = buf.d_src;
     dim3 grid(pw / block_size, ph / block_size);
     const size_t shared_mem = 3u * (size_t)block_size * (size_t)block_size * sizeof(float);
 
@@ -481,12 +440,6 @@ void cuda_encode_channel(int ch, int pw, int ph, int block_size, bool is_keyfram
             d_src, buf.d_prev, buf.d_curr, buf.d_coeff, qm, g_d_zigzag, pw, ph, is_keyframe);
     }
     CUDA_CHECK(cudaGetLastError());
-}
-
-void cuda_record_encode_slot_done(int slot, int last_ch) {
-    const int s = slot & 1;
-    const int lc = last_ch < 0 ? 0 : (last_ch > MAX_CH - 1 ? MAX_CH - 1 : last_ch);
-    CUDA_CHECK(cudaEventRecord(g_evt_encode_slot_done[s], g_stream[lc]));
 }
 
 void cuda_rle_channel_indexed(int ch, int num_blocks, int block_size, uint32_t* out_rle_bytes) {
@@ -553,16 +506,6 @@ void cuda_swap_recon() {
 
 void cuda_sync_channel(int ch) { CUDA_CHECK(cudaStreamSynchronize(g_stream[ch])); }
 void cuda_sync_all()           { for (int i = 0; i < g_num_ch; ++i) cuda_sync_channel(i); }
-
-int16_t* cuda_alloc_pinned_coeffs(size_t num_elements) {
-    int16_t* ptr = nullptr;
-    CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&ptr), num_elements * sizeof(int16_t), cudaHostAllocDefault));
-    return ptr;
-}
-
-void cuda_free_pinned_coeffs(int16_t* ptr) {
-    if (ptr) CUDA_CHECK(cudaFreeHost(ptr));
-}
 
 void cuda_memcpy_to_host(void* host_ptr, const void* device_ptr, size_t bytes) {
     CUDA_CHECK(cudaMemcpy(host_ptr, device_ptr, bytes, cudaMemcpyDeviceToHost));

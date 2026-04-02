@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-                      
-                      
-"""Порівняння двох JSON з capture_baseline.py (відносні зміни %)."""
+"""Compare two baseline JSON files from capture_baseline.py (% deltas)."""
+
 from __future__ import annotations
 
 import argparse
@@ -21,19 +20,45 @@ def main() -> int:
     ap.add_argument("before", type=Path)
     ap.add_argument("after", type=Path)
     args = ap.parse_args()
+
     a = json.loads(args.before.read_text(encoding="utf-8"))
     b = json.loads(args.after.read_text(encoding="utf-8"))
     ca, da = a.get("compress") or {}, a.get("decompress") or {}
     cb, db = b.get("compress") or {}, b.get("decompress") or {}
+
     if not ca or not cb:
-        print("Missing compress stats in one of files", file=sys.stderr)
+        print("Missing compress stats in one of the files", file=sys.stderr)
         return 1
-    print("compress_fps:", ca.get("compress_fps"), "→", cb.get("compress_fps"), pct(ca["compress_fps"], cb["compress_fps"]))
-    print("compress_ms: ", ca.get("compress_ms"), "→", cb.get("compress_ms"), pct(ca["compress_ms"], cb["compress_ms"]))
+
+    print(
+        "compress_fps:",
+        ca.get("compress_fps"),
+        "->",
+        cb.get("compress_fps"),
+        pct(ca["compress_fps"], cb["compress_fps"]),
+    )
+    print(
+        "compress_ms:",
+        ca.get("compress_ms"),
+        "->",
+        cb.get("compress_ms"),
+        pct(ca["compress_ms"], cb["compress_ms"]),
+    )
     if da and db:
-        print("decode_fps:  ", da.get("decode_fps"), "→", db.get("decode_fps"), pct(da["decode_fps"], db["decode_fps"]))
-        print("avg_ms/frame:", da.get("avg_ms_per_frame"), "→", db.get("avg_ms_per_frame"),
-              pct(da["avg_ms_per_frame"], db["avg_ms_per_frame"]))
+        print(
+            "decode_fps:",
+            da.get("decode_fps"),
+            "->",
+            db.get("decode_fps"),
+            pct(da["decode_fps"], db["decode_fps"]),
+        )
+        print(
+            "avg_ms/frame:",
+            da.get("avg_ms_per_frame"),
+            "->",
+            db.get("avg_ms_per_frame"),
+            pct(da["avg_ms_per_frame"], db["avg_ms_per_frame"]),
+        )
     return 0
 
 

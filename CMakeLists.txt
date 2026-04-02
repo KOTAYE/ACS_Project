@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(askProjectCUDA LANGUAGES CXX CUDA)
+project(flipbook LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CUDA_STANDARD 17)
@@ -13,7 +13,7 @@ set(SHARED_SRC
     src/dct.cpp
     src/quant.cpp
     src/huffman.cpp
-    src/metrics.cpp
+    src/rle.cpp
     src/stb_impl.cpp
 )
 
@@ -30,12 +30,13 @@ target_include_directories(tinyexr_c PUBLIC ${CMAKE_SOURCE_DIR}/third_party)
 target_link_libraries(tinyexr_c PRIVATE ZLIB::ZLIB)
 
 add_executable(flipbook_cuda
-    src/main_cuda.cpp
+    src/main.cpp
     src/codec.cpp
     src/cuda_kernels.cu
     src/rle_gpu.cu
     ${SHARED_SRC}
 )
+target_compile_definitions(flipbook_cuda PRIVATE FLIPBOOK_CUDA)
 target_include_directories(flipbook_cuda PRIVATE ${INC_DIRS})
 target_link_libraries(flipbook_cuda PRIVATE tinyexr_c)
 set_target_properties(flipbook_cuda PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
@@ -43,7 +44,7 @@ set_target_properties(flipbook_cuda PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 find_package(OpenMP REQUIRED COMPONENTS CXX)
 
 add_executable(flipbook_omp
-    src/main_omp.cpp
+    src/main.cpp
     bench/codec_cpu.cpp
     ${SHARED_SRC}
 )
@@ -52,7 +53,7 @@ target_compile_definitions(flipbook_omp PRIVATE USE_OMP)
 target_link_libraries(flipbook_omp PRIVATE OpenMP::OpenMP_CXX tinyexr_c)
 
 add_executable(flipbook_serial
-    src/main_serial.cpp
+    src/main.cpp
     bench/codec_cpu.cpp
     ${SHARED_SRC}
 )

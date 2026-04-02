@@ -6,7 +6,6 @@
 #include <fstream>
 #include <algorithm>
 #include <filesystem>
-#include <future>
 #include <chrono>
 #include <array>
 #include <cstring>
@@ -20,7 +19,8 @@
 #include "dct.h"
 #include "quant.h"
 #include "huffman.h"
-#include "zigzag.h"
+#include "rle.h"
+#include "image_io.h"
 
 #include "stb_image_write.h"
 
@@ -47,45 +47,7 @@ inline void level_shift_n(float* b, int n, float d) {
     for (int i = 0; i < n; ++i) b[i] += d;
 }
 
-} 
-
-std::vector<int16_t> rle_encode_zeros(const std::vector<int16_t>& in) {
-    std::vector<int16_t> out;
-    out.reserve(in.size() / 2);
-    int i = 0;
-    const int n = static_cast<int>(in.size());
-    while (i < n) {
-        if (in[i] == 0) {
-            int run = 1;
-            while (i + run < n && in[i + run] == 0 && run < 32767) run++;
-            out.push_back(0);
-            out.push_back(static_cast<int16_t>(run));
-            i += run;
-        } else {
-            out.push_back(in[i]);
-            i++;
-        }
-    }
-    return out;
 }
-
-void rle_decode_zeros(const std::vector<int16_t>& in, std::vector<int16_t>& out) {
-    int i = 0, o = 0;
-    const int n = static_cast<int>(in.size());
-    const int out_n = static_cast<int>(out.size());
-    while (i < n && o < out_n) {
-        if (in[i] == 0) {
-            if (i + 1 >= n) break;
-            int run = in[i + 1];
-            for (int k = 0; k < run && o < out_n; ++k) out[o++] = 0;
-            i += 2;
-        } else {
-            out[o++] = in[i];
-            i++;
-        }
-    }
-}
-
 
 static void rle_decode_macroblock(const int16_t* rle, int rle_elem_count, int16_t* coef_out, int bs2) {
     int in_idx = 0, out_idx = 0;
@@ -102,8 +64,6 @@ static void rle_decode_macroblock(const int16_t* rle, int rle_elem_count, int16_
     }
     while (out_idx < bs2) coef_out[out_idx++] = 0;
 }
-
-#include "image_io.h"
 
 void compress_flipbook(const std::string& in_dir, const std::string& out_path, int quality, int block_size,
                        bool use_ycbcr) {
@@ -129,10 +89,10 @@ void compress_flipbook(const std::string& in_dir, const std::string& out_path, i
     }
 
     int img_w = 0, img_h = 0, img_ch = 0;
-    std::vector<uint8_t> first_interleaved;
     {
         std::vector<uint8_t> fb = read_file_bytes(frames[0]);
-        if (!decode_image_file_bytes(frames[0], fb.data(), fb.size(), img_w, img_h, img_ch, first_interleaved)) {
+        std::vector<uint8_t> probe;
+        if (!decode_image_file_bytes(frames[0], fb.data(), fb.size(), img_w, img_h, img_ch, probe)) {
             std::cerr << "Failed to decode the first frame: " << frames[0] << "\n";
             return;
         }
@@ -169,47 +129,17 @@ void compress_flipbook(const std::string& in_dir, const std::string& out_path, i
     std::cout << "Compressing " << frames.size() << " frames into " << out_path << "...\n";
     auto t_compress_start = std::chrono::high_resolution_clock::now();
 
-#ifdef USE_OMP
-    std::future<std::vector<uint8_t>> prefetch_interleaved;
-#endif
-
     for (size_t f_idx = 0; f_idx < frames.size(); ++f_idx) {
+        const std::vector<uint8_t> fb = read_file_bytes(frames[f_idx]);
         std::vector<uint8_t> interleaved;
-        if (f_idx == 0) {
-            interleaved = std::move(first_interleaved);
-        } else {
-#ifdef USE_OMP
-            interleaved = prefetch_interleaved.get();
-#else
-            std::vector<uint8_t> fb = read_file_bytes(frames[f_idx]);
-            int w = 0, h = 0, c = 0;
-            if (!decode_image_file_bytes(frames[f_idx], fb.data(), fb.size(), w, h, c, interleaved) ||
-                w != img_w || h != img_h || c != img_ch) {
-                std::cerr << "\nError: Invalid frame or dimensions mismatched at " << frames[f_idx] << "\n";
-                break;
-            }
-#endif
+        int w = 0, h = 0, c = 0;
+        if (!decode_image_file_bytes(frames[f_idx], fb.data(), fb.size(), w, h, c, interleaved) ||
+            w != img_w || h != img_h || c != img_ch) {
+            std::cerr << "\nError: invalid frame " << frames[f_idx] << "\n";
+            frame_destroy(prev_recon);
+            frame_destroy(curr_recon);
+            return;
         }
-
-        if (interleaved.empty()) {
-            std::cerr << "\nError: empty decode at " << frames[f_idx] << "\n";
-            break;
-        }
-
-#ifdef USE_OMP
-        if (f_idx + 1 < frames.size()) {
-            const std::string next_path = frames[f_idx + 1];
-            const int ew = img_w, eh = img_h, ec = img_ch;
-            prefetch_interleaved = std::async(std::launch::async, [next_path, ew, eh, ec]() {
-                std::vector<uint8_t> fb = read_file_bytes(next_path);
-                std::vector<uint8_t> out;
-                int w = 0, h = 0, c = 0;
-                if (!decode_image_file_bytes(next_path, fb.data(), fb.size(), w, h, c, out)) return std::vector<uint8_t>{};
-                if (w != ew || h != eh || c != ec) return std::vector<uint8_t>{};
-                return out;
-            });
-        }
-#endif
 
         Frame current = rgb_to_planes_parallel(interleaved.data(), img_w, img_h, img_ch, use_ycbcr, block_size);
 
@@ -320,8 +250,7 @@ void compress_flipbook(const std::string& in_dir, const std::string& out_path, i
     size_t raw_size = static_cast<size_t>(img_w) * img_h * img_ch * frames.size();
     double ratio = (double)raw_size / (double)file_size;
 
-    std::cout << "\n  Finished compressing flipbook.\n";
-    std::cout << "  [BENCHMARK] compress_ms=" << compress_ms
+    std::cout << "[BENCHMARK] compress_ms=" << compress_ms
               << " frames=" << frames.size()
               << " compress_fps=" << compress_fps
               << " raw_bytes=" << raw_size
@@ -367,14 +296,11 @@ void decompress_flipbook(const std::string& in_path, const std::string& out_dir)
 
     stbi_write_png_compression_level = 1;
 
-    constexpr int NUM_WRITE_BUFS = 4;
     const size_t rgb_size = static_cast<size_t>(header.width) * header.height * header.channels;
 
     std::vector<int16_t> channel_buffer;
     std::vector<uint8_t> encoded;
-    std::vector<std::vector<uint8_t>> rgb_ring(NUM_WRITE_BUFS);
-    for (auto& buf : rgb_ring) buf.resize(rgb_size);
-    std::future<void> write_futures[NUM_WRITE_BUFS];
+    std::vector<uint8_t> rgb(rgb_size);
 
     std::cout << "Decompressing " << header.frame_count << " frames to " << out_dir << "...\n";
 
@@ -409,6 +335,8 @@ void decompress_flipbook(const std::string& in_path, const std::string& out_dir)
 
             if (!in || num_blocks_file > 10000000u) {
                 std::cerr << "\nCorrupt channel header (frame " << f_idx << " ch " << ch << ")\n";
+                frame_destroy(prev_recon);
+                frame_destroy(curr_recon);
                 return;
             }
 
@@ -503,36 +431,22 @@ void decompress_flipbook(const std::string& in_path, const std::string& out_dir)
         auto t_decode_end = std::chrono::high_resolution_clock::now();
         total_decode_ms += std::chrono::duration<double, std::milli>(t_decode_end - t_decode_start).count();
 
-        int slot = f_idx % NUM_WRITE_BUFS;
-
-        if (write_futures[slot].valid()) write_futures[slot].get();
-
-        planes_to_rgb_parallel(curr_recon, rgb_ring[slot], use_ycbcr);
+        planes_to_rgb_parallel(curr_recon, rgb, use_ycbcr);
 
         char filename[256];
         std::snprintf(filename, sizeof(filename), "/frame_%04d.png", f_idx);
-        std::string out_path_png = out_dir + filename;
-        int w = header.width, h = header.height, ch_count = header.channels;
-        uint8_t* buf_ptr = rgb_ring[slot].data();
-
-        write_futures[slot] = std::async(std::launch::async,
-                                         [out_path_png, buf_ptr, w, h, ch_count]() {
-                                             stbi_write_png(out_path_png.c_str(), w, h, ch_count, buf_ptr,
-                                                            w * ch_count);
-                                         });
+        const std::string out_path_png = out_dir + filename;
+        stbi_write_png(out_path_png.c_str(), header.width, header.height, header.channels, rgb.data(),
+                       header.width * header.channels);
 
         std::cout << "\r  Progress: " << f_idx + 1 << "/" << header.frame_count << std::flush;
 
         std::swap(curr_recon.data, prev_recon.data);
     }
 
-    for (int i = 0; i < NUM_WRITE_BUFS; ++i)
-        if (write_futures[i].valid()) write_futures[i].get();
-
     double avg_ms = total_decode_ms / header.frame_count;
     double fps = 1000.0 / avg_ms;
-    std::cout << "\n  Finished decompressing flipbook.\n";
-    std::cout << "  [BENCHMARK] decode_total_ms=" << total_decode_ms
+    std::cout << "[BENCHMARK] decode_total_ms=" << total_decode_ms
               << " frames=" << header.frame_count
               << " avg_ms=" << avg_ms
               << " decode_fps=" << fps << "\n";

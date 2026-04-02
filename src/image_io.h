@@ -4,11 +4,6 @@
 #include <vector>
 #include <string>
 
-Frame load_image(const char* path);
-
-bool save_image(const char* path, const Frame& frame);
-
-
 Frame rgb_to_planes_parallel(uint8_t* raw, int w, int h, int ch, bool use_ycbcr,
                              int block_align = 8);
 void planes_to_rgb_parallel(const Frame& f, std::vector<uint8_t>& out_rgb, bool use_ycbcr);

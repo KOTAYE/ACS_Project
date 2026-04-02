@@ -4,7 +4,6 @@
 #include <array>
 #include <cstring>
 
-static constexpr int kBlockBytes = 64 * static_cast<int>(sizeof(float));
 static constexpr int kNumSymbols = 256;
 static constexpr int kMaxNodes = 512;
 
@@ -127,64 +126,6 @@ static int read_bit_abs(const uint8_t* packed, int packed_len_bytes, int abs_bit
     return (packed[bi] >> (7 - (abs_bit & 7))) & 1;
 }
 
-int huffman_encode_block_64(const float* block, uint8_t* encoded, int encoded_max_size) {
-    constexpr int header_size = kNumSymbols * static_cast<int>(sizeof(uint32_t));
-    if (encoded_max_size < header_size) return -1;
-
-    auto* freq = reinterpret_cast<uint32_t*>(encoded);
-    std::fill(freq, freq + kNumSymbols, uint32_t{0});
-
-    const auto* bytes = reinterpret_cast<const uint8_t*>(block);
-    for (int i = 0; i < kBlockBytes; ++i) ++freq[bytes[i]];
-
-    const int root = build_tree(freq);
-    if (root < 0) return -1;
-    build_codes(root);
-
-    if (nodes[root].left < 0 && nodes[root].right < 0) {
-        code_len [nodes[root].symbol] = 1;
-        code_bits[nodes[root].symbol] = 0;
-    }
-
-    const int max_bytes = encoded_max_size - header_size;
-    uint8_t* wr_buf = encoded + header_size;
-    std::memset(wr_buf, 0, static_cast<std::size_t>(max_bytes));
-
-    int byte_pos = 0, bit_pos = 0;
-    for (int i = 0; i < kBlockBytes; ++i) {
-        const int s = bytes[i];
-        write_bits(wr_buf, byte_pos, bit_pos, max_bytes, code_bits[s], code_len[s]);
-    }
-    if (bit_pos != 0) ++byte_pos;
-    return header_size + byte_pos;
-}
-
-int huffman_decode_block_64(const uint8_t* encoded, int encoded_len, float* block) {
-    constexpr int header_size = kNumSymbols * static_cast<int>(sizeof(uint32_t));
-    if (encoded_len < header_size) return -1;
-
-    const auto* freq = reinterpret_cast<const uint32_t*>(encoded);
-    const int root = build_tree(freq);
-    if (root < 0) return -1;
-    build_codes(root);
-    if (nodes[root].left < 0 && nodes[root].right < 0) {
-        code_len [nodes[root].symbol] = 1;
-        code_bits[nodes[root].symbol] = 0;
-    }
-
-    int byte_pos = 0, bit_pos = 0;
-    const uint8_t* rd_buf = encoded + header_size;
-    const int rd_len = encoded_len - header_size;
-    auto* out = reinterpret_cast<uint8_t*>(block);
-
-    for (int i = 0; i < kBlockBytes; ++i) {
-        const int s = decode_symbol(rd_buf, byte_pos, bit_pos, rd_len, root);
-        if (s < 0) return -1;
-        out[i] = static_cast<uint8_t>(s);
-    }
-    return 0;
-}
-
 int huffman_encode_bytes(const uint8_t* in_data, int in_len, uint8_t* encoded, int encoded_max_size) {
     constexpr int header_size = kNumSymbols * static_cast<int>(sizeof(uint32_t));
     if (encoded_max_size < header_size) return -1;
@@ -214,31 +155,6 @@ int huffman_encode_bytes(const uint8_t* in_data, int in_len, uint8_t* encoded, i
     }
     if (bit_pos != 0) ++byte_pos;
     return header_size + byte_pos;
-}
-
-void huffman_prepare_codebook(const uint32_t histogram[256], uint32_t out_bits[256], uint8_t out_lens[256], uint32_t out_freq[256]) {
-    uint32_t max_freq = 0;
-    for (int i = 0; i < 256; ++i) if (histogram[i] > max_freq) max_freq = histogram[i];
-
-    uint32_t freq[256];
-    if (max_freq <= 65535) {
-        for (int i = 0; i < 256; ++i) freq[i] = (uint32_t)histogram[i];
-    } else {
-        float fscale = 65535.0f / (float)max_freq;
-        for (int i = 0; i < 256; ++i) freq[i] = (histogram[i] > 0) ? (uint32_t)std::max(1u, (uint32_t)(histogram[i] * fscale)) : 0;
-    }
-
-    int root = build_tree(freq);
-    if (root >= 0) {
-        build_codes(root);
-        if (nodes[root].left < 0 && nodes[root].right < 0) {
-            code_len[nodes[root].symbol] = 1;
-            code_bits[nodes[root].symbol] = 0;
-        }
-    }
-    std::memcpy(out_bits, code_bits.data(), 256 * sizeof(uint32_t));
-    std::memcpy(out_lens, code_len.data(), 256 * sizeof(uint8_t));
-    std::memcpy(out_freq, freq, 256 * sizeof(uint32_t));
 }
 
 int huffman_codebook_from_freq32(const uint32_t freq[256], uint32_t out_bits[256], uint8_t out_lens[256]) {

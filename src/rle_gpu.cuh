@@ -1,11 +1,7 @@
 #pragma once
-#include <cstdint>
-#include <cstddef>
 
-struct GpuHuffNode {
-    int16_t children[2];
-    int16_t symbol;
-};
+#include <cstddef>
+#include <cstdint>
 
 void rle_gpu_init(int ch, size_t max_elements);
 void rle_gpu_cleanup();

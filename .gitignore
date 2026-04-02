@@ -148,8 +148,14 @@ Thumbs.db
 Frames/
 frames_restored/
 benchmark_results/
+charts/
 frames_cuda/
 frames_recon_*/
+reconstructed/
+restored_cuda/
+restored_omp/
+restored_serial/
+profiler_reports/
 *.qdstrm
 *.nsys-rep
 
@@ -169,5 +175,4 @@ _ci_recon_*/
 flipbooks/flipbook_textures1_FC.png
 *.pdf
 
-.idea/
 third_party/

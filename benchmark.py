@@ -1,16 +1,11 @@
 #!/usr/bin/env python3
-
-"""
-Usage:
-    python3 benchmark.py --runs 3 --input-dir Frames --quality 80
-"""
+"""Time flipbook compress for CUDA, OpenMP, and serial builds."""
 
 import argparse
-import subprocess
-import time
 import os
+import subprocess
 import sys
-
+import time
 def parse_args():
     p = argparse.ArgumentParser(description="Flipbook encoding benchmark")
     p.add_argument("--runs", type=int, default=3,
@@ -27,7 +22,7 @@ def robust_remove(path):
     if os.path.exists(path):
         try:
             os.remove(path)
-        except:
+        except OSError:
             pass
 
 def run_once(exe, input_dir, quality, output_bin):
@@ -42,9 +37,10 @@ def run_once(exe, input_dir, quality, output_bin):
     elapsed = time.perf_counter() - start
 
     if r.returncode != 0:
+        if r.stderr:
+            print(r.stderr.strip(), file=sys.stderr)
         return None
     return elapsed
-
 def benchmark_backend(name, exe, input_dir, quality, warmup, runs):
     """Warm up, then run iterations. Return list of times."""
     output_bin = f"_bench_{name.lower()}.bin"
@@ -77,7 +73,7 @@ def print_table(results):
         if name not in results:
             continue
         d = results[name]
-        sp = f"{serial_avg / d['avg']:.2f}x" if serial_avg else "—"
+        sp = f"{serial_avg / d['avg']:.2f}x" if serial_avg else "n/a"
         print(f"  {name:<10} {d['avg']:<12.3f} {d['min']:<12.3f} {sp:<10}")
     print("=" * 52)
 
@@ -87,8 +83,7 @@ def main():
     build_dir = os.path.join(project_root, "build")
 
     if not os.path.exists(build_dir):
-        print(f"Error: Build directory not found at {build_dir}. Please run 'make' first.")
-        sys.exit(1)
+        print(f"Build directory not found: {build_dir}", file=sys.stderr)        sys.exit(1)
 
     backends = {
         "CUDA":   os.path.join(build_dir, "flipbook_cuda"),
@@ -112,9 +107,9 @@ def main():
                 "avg": sum(times) / len(times),
                 "min": min(times),
             }
-            print(f"  → Average: {results[name]['avg']:.3f}s\n")
+            print(f"  avg: {results[name]['avg']:.3f}s\n")
         else:
-            print(f"  → FAILED.\n")
+            print("  failed\n")
 
     if not results:
         print("No results collected.")
