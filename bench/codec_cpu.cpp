@@ -7,6 +7,9 @@
 #include <algorithm>
 #include <filesystem>
 #include <future>
+#include <chrono>
+#include <array>
+#include <cstring>
 
 #ifdef USE_OMP
 #include <omp.h>
@@ -17,37 +20,34 @@
 #include "dct.h"
 #include "quant.h"
 #include "huffman.h"
-#include "metrics.h"
+#include "zigzag.h"
 
-#include "stb_image.h"
 #include "stb_image_write.h"
 
 namespace fs = std::filesystem;
 
-inline int codec_pad8(int n) { return ((n + 7) / 8) * 8; }
-
 #pragma pack(push, 1)
 struct BinHeader {
-    char magic[4] = {'F', 'L', 'I', '2'};
+    char magic[4] = {'F', 'L', 'I', '3'};
     int32_t width;
     int32_t height;
     int32_t channels;
     int32_t quality;
+    int32_t block_size;
     int32_t frame_count;
     int32_t use_ycbcr = 1;
 };
 #pragma pack(pop)
 
-const int ZIGZAG_ORDER[64] = {
-     0,  1,  5,  6, 14, 15, 27, 28,
-     2,  4,  7, 13, 16, 26, 29, 42,
-     3,  8, 12, 17, 25, 30, 41, 43,
-     9, 11, 18, 24, 31, 40, 44, 53,
-    10, 19, 23, 32, 39, 45, 52, 54,
-    20, 22, 33, 38, 46, 51, 55, 60,
-    21, 34, 37, 47, 50, 56, 59, 61,
-    35, 36, 48, 49, 57, 58, 62, 63
-};
+namespace {
+
+inline int codec_pad(int n, int bs) { return ((n + bs - 1) / bs) * bs; }
+
+inline void level_shift_n(float* b, int n, float d) {
+    for (int i = 0; i < n; ++i) b[i] += d;
+}
+
+} // namespace
 
 std::vector<int16_t> rle_encode_zeros(const std::vector<int16_t>& in) {
     std::vector<int16_t> out;
@@ -86,86 +86,32 @@ void rle_decode_zeros(const std::vector<int16_t>& in, std::vector<int16_t>& out)
     }
 }
 
-Frame rgb_to_planes_parallel(uint8_t* raw, int w, int h, int ch, bool use_ycbcr) {
-    Frame f = frame_create(w, h, ch, use_ycbcr);
-    if (use_ycbcr && ch >= 3) {
-        #ifdef USE_OMP
-        #pragma omp parallel for
-        #endif
-        for (int y = 0; y < h; ++y) {
-            for (int x = 0; x < w; ++x) {
-                float R = static_cast<float>(raw[(y * w + x) * ch + 0]);
-                float G = static_cast<float>(raw[(y * w + x) * ch + 1]);
-                float B = static_cast<float>(raw[(y * w + x) * ch + 2]);
-
-                float Y  =  0.299f * R + 0.587f * G + 0.114f * B;
-                f.at(0, x, y) = Y;
-
-                if (x % 2 == 0 && y % 2 == 0) {
-                    float Cb = -0.168736f * R - 0.331264f * G + 0.5f * B + 128.0f;
-                    float Cr =  0.5f * R - 0.418688f * G - 0.081312f * B + 128.0f;
-                    f.at(1, x / 2, y / 2) = Cb;
-                    f.at(2, x / 2, y / 2) = Cr;
-                }
-            }
-        }
-    } else {
-        #ifdef USE_OMP
-        #pragma omp parallel for
-        #endif
-        for (int y = 0; y < h; ++y) {
-            for (int x = 0; x < w; ++x) {
-                for (int c = 0; c < ch; ++c) {
-                    f.at(c, x, y) = static_cast<float>(raw[(y * w + x) * ch + c]);
-                }
-            }
+// Per-block RLE (same semantics as GPU RleDecodePerBlockKernel).
+static void rle_decode_macroblock(const int16_t* rle, int rle_elem_count, int16_t* coef_out, int bs2) {
+    int in_idx = 0, out_idx = 0;
+    while (in_idx < rle_elem_count && out_idx < bs2) {
+        if (rle[in_idx] == 0) {
+            if (in_idx + 1 >= rle_elem_count) break;
+            const int run = rle[in_idx + 1];
+            for (int k = 0; k < run && out_idx < bs2; ++k) coef_out[out_idx++] = 0;
+            in_idx += 2;
+        } else {
+            coef_out[out_idx++] = rle[in_idx];
+            in_idx++;
         }
     }
-    return f;
+    while (out_idx < bs2) coef_out[out_idx++] = 0;
 }
 
-void planes_to_rgb_parallel(const Frame& f, std::vector<uint8_t>& out_rgb, bool use_ycbcr) {
-    int w = f.width;
-    int h = f.height;
-    int ch = f.channels;
+#include "image_io.h"
 
-    if (use_ycbcr && ch >= 3) {
-        #ifdef USE_OMP
-        #pragma omp parallel for
-        #endif
-        for (int y = 0; y < h; ++y) {
-            for (int x = 0; x < w; ++x) {
-                float Y  = f.at(0, x, y);
-                float Cb = f.at(1, x / 2, y / 2) - 128.0f;
-                float Cr = f.at(2, x / 2, y / 2) - 128.0f;
-
-                float R = Y + 1.402f * Cr;
-                float G = Y - 0.344136f * Cb - 0.714136f * Cr;
-                float B = Y + 1.772f * Cb;
-
-                out_rgb[(y * w + x) * ch + 0] = static_cast<uint8_t>(std::clamp(R + 0.5f, 0.0f, 255.0f));
-                out_rgb[(y * w + x) * ch + 1] = static_cast<uint8_t>(std::clamp(G + 0.5f, 0.0f, 255.0f));
-                out_rgb[(y * w + x) * ch + 2] = static_cast<uint8_t>(std::clamp(B + 0.5f, 0.0f, 255.0f));
-
-                if (ch == 4) out_rgb[(y * w + x) * ch + 3] = 255;
-            }
-        }
-    } else {
-        #ifdef USE_OMP
-        #pragma omp parallel for
-        #endif
-        for (int y = 0; y < h; ++y) {
-            for (int x = 0; x < w; ++x) {
-                for (int c = 0; c < ch; ++c) {
-                    float val = f.at(c, x, y);
-                    out_rgb[(y * w + x) * ch + c] = static_cast<uint8_t>(std::clamp(val + 0.5f, 0.0f, 255.0f));
-                }
-            }
-        }
+void compress_flipbook(const std::string& in_dir, const std::string& out_path, int quality, int block_size,
+                       bool use_ycbcr) {
+    if (block_size != 8 && block_size != 16 && block_size != 32) {
+        std::cerr << "Error: block_size must be 8, 16, or 32.\n";
+        return;
     }
-}
 
-void compress_flipbook(const std::string& in_dir, const std::string& out_path, int quality, bool use_ycbcr) {
     if (!fs::exists(in_dir) || !fs::is_directory(in_dir)) {
         std::cerr << "Input must be a valid directory containing frames.\n";
         return;
@@ -175,24 +121,26 @@ void compress_flipbook(const std::string& in_dir, const std::string& out_path, i
     for (const auto& entry : fs::directory_iterator(in_dir)) {
         if (entry.is_regular_file()) frames.push_back(entry.path().string());
     }
-    std::sort(frames.begin(), frames.end());
+    sort_frame_paths(frames);
 
     if (frames.empty()) {
         std::cerr << "No frames found in directory " << in_dir << "\n";
         return;
     }
 
-    int img_w, img_h, img_ch;
-    uint8_t* first_raw = stbi_load(frames[0].c_str(), &img_w, &img_h, &img_ch, 0);
-    if (!first_raw) {
-        std::cerr << "Failed to load the first frame: " << frames[0] << "\n";
-        return;
+    int img_w = 0, img_h = 0, img_ch = 0;
+    std::vector<uint8_t> first_interleaved;
+    {
+        std::vector<uint8_t> fb = read_file_bytes(frames[0]);
+        if (!decode_image_file_bytes(frames[0], fb.data(), fb.size(), img_w, img_h, img_ch, first_interleaved)) {
+            std::cerr << "Failed to decode the first frame: " << frames[0] << "\n";
+            return;
+        }
     }
 
     std::ofstream out(out_path, std::ios::binary);
     if (!out) {
         std::cerr << "Failed to open " << out_path << " for writing\n";
-        stbi_image_free(first_raw);
         return;
     }
 
@@ -201,134 +149,184 @@ void compress_flipbook(const std::string& in_dir, const std::string& out_path, i
     header.height = img_h;
     header.channels = img_ch;
     header.quality = quality;
+    header.block_size = block_size;
     header.frame_count = static_cast<int32_t>(frames.size());
     header.use_ycbcr = use_ycbcr ? 1 : 0;
     out.write(reinterpret_cast<const char*>(&header), sizeof(header));
 
-    const QuantMatrix luma_qm   = make_quant_matrix(kJpegLumaQuant, quality);
-    const QuantMatrix chroma_qm = make_quant_matrix(kJpegChromaQuant, quality);
+    const QuantMatrix luma_qm = make_quant_matrix(kJpegLumaQuant, quality, block_size);
+    const QuantMatrix chroma_qm = make_quant_matrix(kJpegChromaQuant, quality, block_size);
+    const std::vector<int> zigzag = codec_zigzag_scan_table(block_size);
+    const int bs = block_size;
+    const int bpp = bs * bs;
 
-    Frame prev_recon = frame_create(img_w, img_h, img_ch, use_ycbcr);
-    Frame curr_recon = frame_create(img_w, img_h, img_ch, use_ycbcr);
+    Frame prev_recon = frame_create(img_w, img_h, img_ch, use_ycbcr, block_size);
+    Frame curr_recon = frame_create(img_w, img_h, img_ch, use_ycbcr, block_size);
 
     std::vector<int16_t> channel_buffer;
     std::vector<uint8_t> encoded;
 
     std::cout << "Compressing " << frames.size() << " frames into " << out_path << "...\n";
+    auto t_compress_start = std::chrono::high_resolution_clock::now();
 
 #ifdef USE_OMP
-    std::future<uint8_t*> prefetch;
+    std::future<std::vector<uint8_t>> prefetch_interleaved;
 #endif
 
     for (size_t f_idx = 0; f_idx < frames.size(); ++f_idx) {
-        uint8_t* raw = nullptr;
+        std::vector<uint8_t> interleaved;
         if (f_idx == 0) {
-            raw = first_raw;
+            interleaved = std::move(first_interleaved);
         } else {
 #ifdef USE_OMP
-            raw = prefetch.get();
+            interleaved = prefetch_interleaved.get();
 #else
-            int w, h, c;
-            raw = stbi_load(frames[f_idx].c_str(), &w, &h, &c, 0);
-#endif
-            if (!raw) {
+            std::vector<uint8_t> fb = read_file_bytes(frames[f_idx]);
+            int w = 0, h = 0, c = 0;
+            if (!decode_image_file_bytes(frames[f_idx], fb.data(), fb.size(), w, h, c, interleaved) ||
+                w != img_w || h != img_h || c != img_ch) {
                 std::cerr << "\nError: Invalid frame or dimensions mismatched at " << frames[f_idx] << "\n";
                 break;
             }
+#endif
+        }
+
+        if (interleaved.empty()) {
+            std::cerr << "\nError: empty decode at " << frames[f_idx] << "\n";
+            break;
         }
 
 #ifdef USE_OMP
         if (f_idx + 1 < frames.size()) {
-            prefetch = std::async(std::launch::async, [path = frames[f_idx + 1]]() -> uint8_t* {
-                int w, h, c;
-                return stbi_load(path.c_str(), &w, &h, &c, 0);
+            const std::string next_path = frames[f_idx + 1];
+            const int ew = img_w, eh = img_h, ec = img_ch;
+            prefetch_interleaved = std::async(std::launch::async, [next_path, ew, eh, ec]() {
+                std::vector<uint8_t> fb = read_file_bytes(next_path);
+                std::vector<uint8_t> out;
+                int w = 0, h = 0, c = 0;
+                if (!decode_image_file_bytes(next_path, fb.data(), fb.size(), w, h, c, out)) return std::vector<uint8_t>{};
+                if (w != ew || h != eh || c != ec) return std::vector<uint8_t>{};
+                return out;
             });
         }
 #endif
 
-        Frame current = rgb_to_planes_parallel(raw, img_w, img_h, img_ch, use_ycbcr);
-        stbi_image_free(raw);
+        Frame current = rgb_to_planes_parallel(interleaved.data(), img_w, img_h, img_ch, use_ycbcr, block_size);
 
         bool is_keyframe = (f_idx == 0);
 
         for (int ch = 0; ch < current.channels; ++ch) {
             const QuantMatrix& qm = (ch == 0) ? luma_qm : chroma_qm;
-            const float* src_channel = current.channel_ptr(ch);
-            const float* prev_channel = prev_recon.channel_ptr(ch);
-            float* recon_channel = curr_recon.channel_ptr(ch);
+            const uint8_t* src_channel = current.channel_ptr(ch);
+            const uint8_t* prev_channel = prev_recon.channel_ptr(ch);
+            uint8_t* recon_channel = curr_recon.channel_ptr(ch);
 
             const int padded_w = current.padded_width[ch];
             const int padded_h = current.padded_height[ch];
-            const int blocks_x = padded_w / 8;
-            const int blocks_y = padded_h / 8;
+            const int blocks_x = padded_w / bs;
+            const int blocks_y = padded_h / bs;
             const int total_blocks = blocks_x * blocks_y;
-            const int channel_samples = total_blocks * 64;
+            const int channel_samples = total_blocks * bpp;
 
             if (static_cast<int>(channel_buffer.size()) < channel_samples)
                 channel_buffer.resize(channel_samples);
 
-            #ifdef USE_OMP
-            #pragma omp parallel for
-            #endif
+#ifdef USE_OMP
+#pragma omp parallel for
+#endif
             for (int by = 0; by < blocks_y; ++by) {
-                float block_in[64], prev_block[64], dct_out[64], idct_out[64];
+                std::vector<float> block_in(static_cast<size_t>(bpp));
+                std::vector<float> prev_block(static_cast<size_t>(bpp));
+                std::vector<float> dct_out(static_cast<size_t>(bpp));
+                std::vector<float> idct_out(static_cast<size_t>(bpp));
                 for (int bx = 0; bx < blocks_x; ++bx) {
-                    int sample_idx = (by * blocks_x + bx) * 64;
-                    extract_block_8x8(src_channel, padded_w, bx, by, block_in);
+                    int sample_idx = (by * blocks_x + bx) * bpp;
+                    extract_block_n(src_channel, padded_w, bx, by, bs, block_in.data());
 
                     if (!is_keyframe) {
-                        extract_block_8x8(prev_channel, padded_w, bx, by, prev_block);
-                        for (int i = 0; i < 64; ++i) block_in[i] -= prev_block[i];
+                        extract_block_n(prev_channel, padded_w, bx, by, bs, prev_block.data());
+                        for (int i = 0; i < bpp; ++i) block_in[i] -= prev_block[i];
                     } else {
-                        level_shift(block_in, -128.0f);
+                        level_shift_n(block_in.data(), bpp, -128.0f);
                     }
 
-                    dct2d_separable(block_in, dct_out);
-                    quantize_block_64(dct_out, qm);
+                    dct2d_separable_n(block_in.data(), dct_out.data(), bs);
+                    quantize_block(dct_out.data(), qm, bpp);
 
-                    for (int i = 0; i < 64; ++i)
-                        channel_buffer[sample_idx + i] = static_cast<int16_t>(dct_out[ZIGZAG_ORDER[i]]);
+                    for (int i = 0; i < bpp; ++i)
+                        channel_buffer[sample_idx + zigzag[i]] = static_cast<int16_t>(dct_out[i]);
 
-                    dequantize_block_64(dct_out, qm);
-                    idct2d_separable(dct_out, idct_out);
+                    dequantize_block(dct_out.data(), qm, bpp);
+                    idct2d_separable_n(dct_out.data(), idct_out.data(), bs);
 
                     if (!is_keyframe) {
-                        for (int i = 0; i < 64; ++i) idct_out[i] += prev_block[i];
+                        for (int i = 0; i < bpp; ++i) idct_out[i] += prev_block[i];
                     } else {
-                        level_shift(idct_out, +128.0f);
+                        level_shift_n(idct_out.data(), bpp, 128.0f);
                     }
 
-                    insert_block_8x8(recon_channel, padded_w, bx, by, idct_out);
+                    insert_block_n(recon_channel, padded_w, bx, by, bs, idct_out.data());
                 }
             }
 
-            std::vector<int16_t> current_ch_buffer(channel_buffer.begin(), channel_buffer.begin() + channel_samples);
+            std::vector<int16_t> current_ch_buffer(channel_buffer.begin(),
+                                                   channel_buffer.begin() + channel_samples);
             std::vector<int16_t> rle_buffer = rle_encode_zeros(current_ch_buffer);
             const uint8_t* raw_bytes = reinterpret_cast<const uint8_t*>(rle_buffer.data());
             const int raw_len = static_cast<int>(rle_buffer.size() * sizeof(int16_t));
 
-            if (encoded.size() < raw_len + 1024) encoded.resize(raw_len + 1024);
+            if (encoded.size() < static_cast<size_t>(raw_len) + 4096u)
+                encoded.resize(static_cast<size_t>(raw_len) + 4096u);
 
-            int encoded_len = huffman_encode_bytes(raw_bytes, raw_len, encoded.data(), encoded.size());
-            if (encoded_len < 0) {
-                std::cerr << "\nCompression failed (buffer overflow)\n";
-                encoded_len = 0;
+            int enc_total = 0;
+            if (raw_len > 0) {
+                enc_total = huffman_encode_bytes(raw_bytes, raw_len, encoded.data(),
+                                                   static_cast<int>(encoded.size()));
+                if (enc_total < 0) {
+                    std::cerr << "\nCompression failed (buffer overflow)\n";
+                    enc_total = 0;
+                }
             }
 
             uint32_t rle_bytes_len = static_cast<uint32_t>(raw_len);
-            out.write(reinterpret_cast<const char*>(&rle_bytes_len), sizeof(rle_bytes_len));
+            uint32_t payload =
+                (enc_total >= 512) ? static_cast<uint32_t>(enc_total - 512) : 0u;
+            uint32_t nb = static_cast<uint32_t>(total_blocks);
 
-            uint32_t len_u32 = static_cast<uint32_t>(encoded_len);
-            out.write(reinterpret_cast<const char*>(&len_u32), sizeof(len_u32));
-            if (encoded_len > 0)
-                out.write(reinterpret_cast<const char*>(encoded.data()), encoded_len);
+            out.write(reinterpret_cast<const char*>(&rle_bytes_len), sizeof(rle_bytes_len));
+            out.write(reinterpret_cast<const char*>(&payload), sizeof(payload));
+            out.write(reinterpret_cast<const char*>(&nb), sizeof(nb));
+
+            std::array<uint16_t, 256> freq{};
+            if (enc_total >= 512)
+                std::memcpy(freq.data(), encoded.data(), 512);
+            out.write(reinterpret_cast<const char*>(freq.data()), 512);
+
+            std::vector<uint32_t> bl(static_cast<size_t>(nb), 0u);
+            out.write(reinterpret_cast<const char*>(bl.data()), nb * sizeof(uint32_t));
+            if (payload > 0)
+                out.write(reinterpret_cast<const char*>(encoded.data() + 512), payload);
         }
 
         std::swap(curr_recon.data, prev_recon.data);
         frame_destroy(current);
         std::cout << "\r  Progress: " << f_idx + 1 << "/" << frames.size() << std::flush;
     }
+    auto t_compress_end = std::chrono::high_resolution_clock::now();
+    double compress_ms = std::chrono::duration<double, std::milli>(t_compress_end - t_compress_start).count();
+    double compress_fps = 1000.0 * frames.size() / compress_ms;
+
+    auto file_size = fs::file_size(out_path);
+    size_t raw_size = static_cast<size_t>(img_w) * img_h * img_ch * frames.size();
+    double ratio = (double)raw_size / (double)file_size;
+
     std::cout << "\n  Finished compressing flipbook.\n";
+    std::cout << "  [BENCHMARK] compress_ms=" << compress_ms
+              << " frames=" << frames.size()
+              << " compress_fps=" << compress_fps
+              << " raw_bytes=" << raw_size
+              << " compressed_bytes=" << file_size
+              << " compression_ratio=" << ratio << "\n";
 
     frame_destroy(prev_recon);
     frame_destroy(curr_recon);
@@ -344,25 +342,31 @@ void decompress_flipbook(const std::string& in_path, const std::string& out_dir)
     BinHeader header;
     in.read(reinterpret_cast<char*>(&header), sizeof(header));
     if (in.gcount() != sizeof(header) || header.magic[0] != 'F' || header.magic[1] != 'L' ||
-        header.magic[2] != 'I' || header.magic[3] != '2') {
+        header.magic[2] != 'I' || header.magic[3] != '3') {
         std::cerr << "Invalid or corrupted bin file: " << in_path << "\n";
+        return;
+    }
+
+    if (header.block_size != 8 && header.block_size != 16 && header.block_size != 32) {
+        std::cerr << "Unsupported block_size " << header.block_size << " in file.\n";
         return;
     }
 
     fs::create_directories(out_dir);
 
     bool use_ycbcr = (header.use_ycbcr != 0);
+    const int bs = header.block_size;
+    const int bpp = bs * bs;
+    const std::vector<int> zigzag = codec_zigzag_scan_table(bs);
 
-    Frame prev_recon = frame_create(header.width, header.height, header.channels, use_ycbcr);
-    Frame curr_recon = frame_create(header.width, header.height, header.channels, use_ycbcr);
+    Frame prev_recon = frame_create(header.width, header.height, header.channels, use_ycbcr, bs);
+    Frame curr_recon = frame_create(header.width, header.height, header.channels, use_ycbcr, bs);
 
-    const QuantMatrix luma_qm   = make_quant_matrix(kJpegLumaQuant, header.quality);
-    const QuantMatrix chroma_qm = make_quant_matrix(kJpegChromaQuant, header.quality);
+    const QuantMatrix luma_qm = make_quant_matrix(kJpegLumaQuant, header.quality, bs);
+    const QuantMatrix chroma_qm = make_quant_matrix(kJpegChromaQuant, header.quality, bs);
 
-    // Use fast PNG compression (level 1 instead of default 8)
     stbi_write_png_compression_level = 1;
 
-    // Ring buffer of N frames for concurrent PNG writes
     constexpr int NUM_WRITE_BUFS = 4;
     const size_t rgb_size = static_cast<size_t>(header.width) * header.height * header.channels;
 
@@ -374,95 +378,164 @@ void decompress_flipbook(const std::string& in_path, const std::string& out_dir)
 
     std::cout << "Decompressing " << header.frame_count << " frames to " << out_dir << "...\n";
 
+    double total_decode_ms = 0.0;
+
     for (int f_idx = 0; f_idx < header.frame_count; ++f_idx) {
         bool is_keyframe = (f_idx == 0);
+        auto t_decode_start = std::chrono::high_resolution_clock::now();
 
         for (int ch = 0; ch < curr_recon.channels; ++ch) {
             const QuantMatrix& qm = (ch == 0) ? luma_qm : chroma_qm;
-            float* recon_channel = curr_recon.channel_ptr(ch);
-            const float* prev_channel = prev_recon.channel_ptr(ch);
+            uint8_t* recon_channel = curr_recon.channel_ptr(ch);
+            const uint8_t* prev_channel = prev_recon.channel_ptr(ch);
 
-            const int blocks_x = prev_recon.padded_width[ch] / 8;
-            const int blocks_y = prev_recon.padded_height[ch] / 8;
+            const int padded_w = curr_recon.padded_width[ch];
+            const int padded_h = curr_recon.padded_height[ch];
+            const int blocks_x = padded_w / bs;
+            const int blocks_y = padded_h / bs;
             const int total_blocks = blocks_x * blocks_y;
-            const int channel_samples = total_blocks * 64;
+            const int channel_samples = total_blocks * bpp;
 
             if (static_cast<int>(channel_buffer.size()) < channel_samples)
                 channel_buffer.resize(channel_samples);
 
-            uint32_t rle_bytes_len = 0;
+            uint32_t rle_bytes_len = 0, len32 = 0, num_blocks_file = 0;
             in.read(reinterpret_cast<char*>(&rle_bytes_len), sizeof(rle_bytes_len));
+            in.read(reinterpret_cast<char*>(&len32), sizeof(len32));
+            in.read(reinterpret_cast<char*>(&num_blocks_file), sizeof(num_blocks_file));
 
-            uint32_t len_u32 = 0;
-            in.read(reinterpret_cast<char*>(&len_u32), sizeof(len_u32));
+            std::vector<uint16_t> h_freq(256);
+            in.read(reinterpret_cast<char*>(h_freq.data()), 512);
+
+            if (!in || num_blocks_file > 10000000u) {
+                std::cerr << "\nCorrupt channel header (frame " << f_idx << " ch " << ch << ")\n";
+                return;
+            }
+
+            std::vector<uint32_t> block_bit_lengths(static_cast<size_t>(num_blocks_file));
+            in.read(reinterpret_cast<char*>(block_bit_lengths.data()),
+                    static_cast<std::streamsize>(num_blocks_file * sizeof(uint32_t)));
+
+            encoded.resize(len32);
+            if (len32 > 0)
+                in.read(reinterpret_cast<char*>(encoded.data()), len32);
+
+            bool per_block_entropy = false;
+            for (uint32_t bl : block_bit_lengths) {
+                if (bl != 0) {
+                    per_block_entropy = true;
+                    break;
+                }
+            }
 
             std::fill(channel_buffer.begin(), channel_buffer.end(), 0);
 
-            if (len_u32 > 0) {
-                encoded.resize(len_u32);
-                in.read(reinterpret_cast<char*>(encoded.data()), len_u32);
+            if (len32 > 0 && per_block_entropy) {
+                if (static_cast<int>(num_blocks_file) != total_blocks) {
+                    std::cerr << "\nnum_blocks mismatch (ch=" << ch << " frame=" << f_idx << ")\n";
+                } else {
+                    std::vector<uint8_t> byte_scratch(static_cast<size_t>(bpp * 2 + 64));
+                    int bit_cursor = 0;
+                    for (int bid = 0; bid < total_blocks; ++bid) {
+                        const int nbits = static_cast<int>(block_bit_lengths[static_cast<size_t>(bid)]);
+                        int16_t* dst = channel_buffer.data() + static_cast<size_t>(bid) * bpp;
+                        if (nbits == 0) {
+                            std::fill(dst, dst + bpp, static_cast<int16_t>(0));
+                            continue;
+                        }
+                        const int nbytes = huffman_decode_bit_window(
+                            h_freq.data(), encoded.data(), static_cast<int>(encoded.size()), bit_cursor, nbits,
+                            byte_scratch.data(), static_cast<int>(byte_scratch.size()));
+                        if (nbytes < 0 || (nbytes & 1) != 0) {
+                            std::cerr << "\nPer-block Huffman decode failed (ch=" << ch << " frame=" << f_idx
+                                      << " block=" << bid << ")\n";
+                            std::fill(dst, dst + bpp, static_cast<int16_t>(0));
+                        } else {
+                            const int rle_elems = nbytes / static_cast<int>(sizeof(int16_t));
+                            rle_decode_macroblock(reinterpret_cast<const int16_t*>(byte_scratch.data()), rle_elems,
+                                                  dst, bpp);
+                        }
+                        bit_cursor += nbits;
+                    }
+                }
+            } else if (len32 > 0 && rle_bytes_len > 0) {
+                std::vector<uint8_t> enc_with_hdr(512 + len32);
+                std::memcpy(enc_with_hdr.data(), h_freq.data(), 512);
+                std::memcpy(enc_with_hdr.data() + 512, encoded.data(), len32);
 
-                std::vector<int16_t> rle_buffer(rle_bytes_len / sizeof(int16_t));
-                uint8_t* raw_bytes = reinterpret_cast<uint8_t*>(rle_buffer.data());
-
-                huffman_decode_bytes(encoded.data(), len_u32, raw_bytes, rle_bytes_len);
-                rle_decode_zeros(rle_buffer, channel_buffer);
+                std::vector<int16_t> rle_buf(rle_bytes_len / sizeof(int16_t));
+                if (huffman_decode_bytes(enc_with_hdr.data(), static_cast<int>(enc_with_hdr.size()),
+                                         reinterpret_cast<uint8_t*>(rle_buf.data()),
+                                         static_cast<int>(rle_bytes_len)) != 0) {
+                    std::cerr << "\nHuffman decode failed (ch=" << ch << " frame=" << f_idx << ")\n";
+                } else {
+                    rle_decode_zeros(rle_buf, channel_buffer);
+                }
             }
 
-            #ifdef USE_OMP
-            #pragma omp parallel for
-            #endif
+#ifdef USE_OMP
+#pragma omp parallel for
+#endif
             for (int by = 0; by < blocks_y; ++by) {
-                float dct_out[64], idct_out[64], prev_block[64];
+                std::vector<float> dct_out(static_cast<size_t>(bpp));
+                std::vector<float> idct_out(static_cast<size_t>(bpp));
+                std::vector<float> prev_block(static_cast<size_t>(bpp));
                 for (int bx = 0; bx < blocks_x; ++bx) {
-                    int sample_idx = (by * blocks_x + bx) * 64;
-                    for (int i = 0; i < 64; ++i)
-                        dct_out[ZIGZAG_ORDER[i]] = static_cast<float>(channel_buffer[sample_idx + i]);
+                    int sample_idx = (by * blocks_x + bx) * bpp;
+                    for (int j = 0; j < bpp; ++j)
+                        dct_out[j] =
+                            static_cast<float>(channel_buffer[sample_idx + zigzag[j]]) * qm[j];
 
-                    dequantize_block_64(dct_out, qm);
-                    idct2d_separable(dct_out, idct_out);
+                    idct2d_separable_n(dct_out.data(), idct_out.data(), bs);
 
                     if (!is_keyframe) {
-                        extract_block_8x8(prev_channel, prev_recon.padded_width[ch], bx, by, prev_block);
-                        for (int i = 0; i < 64; ++i) idct_out[i] += prev_block[i];
+                        extract_block_n(prev_channel, padded_w, bx, by, bs, prev_block.data());
+                        for (int i = 0; i < bpp; ++i) idct_out[i] += prev_block[i];
                     } else {
-                        level_shift(idct_out, +128.0f);
+                        level_shift_n(idct_out.data(), bpp, 128.0f);
                     }
 
-                    insert_block_8x8(recon_channel, curr_recon.padded_width[ch], bx, by, idct_out);
+                    insert_block_n(recon_channel, padded_w, bx, by, bs, idct_out.data());
                 }
             }
         }
 
+        auto t_decode_end = std::chrono::high_resolution_clock::now();
+        total_decode_ms += std::chrono::duration<double, std::milli>(t_decode_end - t_decode_start).count();
+
         int slot = f_idx % NUM_WRITE_BUFS;
 
-        // Wait for this slot's previous write to complete before reusing its buffer
         if (write_futures[slot].valid()) write_futures[slot].get();
 
-        // YCbCr/raw -> RGB into this slot's buffer
         planes_to_rgb_parallel(curr_recon, rgb_ring[slot], use_ycbcr);
 
         char filename[256];
         std::snprintf(filename, sizeof(filename), "/frame_%04d.png", f_idx);
-        std::string out_path = out_dir + filename;
+        std::string out_path_png = out_dir + filename;
         int w = header.width, h = header.height, ch_count = header.channels;
         uint8_t* buf_ptr = rgb_ring[slot].data();
 
         write_futures[slot] = std::async(std::launch::async,
-            [out_path, buf_ptr, w, h, ch_count]() {
-                stbi_write_png(out_path.c_str(), w, h, ch_count, buf_ptr, w * ch_count);
-            });
+                                         [out_path_png, buf_ptr, w, h, ch_count]() {
+                                             stbi_write_png(out_path_png.c_str(), w, h, ch_count, buf_ptr,
+                                                            w * ch_count);
+                                         });
 
         std::cout << "\r  Progress: " << f_idx + 1 << "/" << header.frame_count << std::flush;
 
         std::swap(curr_recon.data, prev_recon.data);
     }
 
-    // Wait for all remaining writes
     for (int i = 0; i < NUM_WRITE_BUFS; ++i)
         if (write_futures[i].valid()) write_futures[i].get();
 
+    double avg_ms = total_decode_ms / header.frame_count;
+    double fps = 1000.0 / avg_ms;
     std::cout << "\n  Finished decompressing flipbook.\n";
+    std::cout << "  [BENCHMARK] decode_total_ms=" << total_decode_ms
+              << " frames=" << header.frame_count
+              << " avg_ms=" << avg_ms
+              << " decode_fps=" << fps << "\n";
 
     frame_destroy(prev_recon);
     frame_destroy(curr_recon);

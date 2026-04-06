@@ -147,3 +147,19 @@ Thumbs.db
 
 Frames/
 frames_restored/
+benchmark_results/
+charts/
+frames_cuda/
+frames_recon_*/
+*.qdstrm
+*.nsys-rep
+
+# Profiling / baseline runs (keep baseline/README.md tracked)
+reports/
+baseline/runs/
+output*.bin
+_*test*
+_quick_*
+_t2.bin
+.idea/
+third_party/

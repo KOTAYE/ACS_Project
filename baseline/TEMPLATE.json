@@ -1,0 +1,21 @@
+{
+  "schema": "flipbook_baseline_v1",
+  "captured_at_utc": "2026-01-01T00:00:00+00:00",
+  "git_rev_short": "abc1234",
+  "executable": "build/flipbook_cuda",
+  "frames_dir": "Frames",
+  "quality": 50,
+  "block_size": 8,
+  "use_ycbcr": true,
+  "compress": {
+    "compress_ms": 0.0,
+    "frames": 0,
+    "compress_fps": 0.0
+  },
+  "decompress": {
+    "decode_total_ms": 0.0,
+    "frames": 0,
+    "avg_ms_per_frame": 0.0,
+    "decode_fps": 0.0
+  }
+}
