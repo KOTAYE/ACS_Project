@@ -1,5 +1,5 @@
-// Еталонне порівняння стиснення: RLE, Huffman, RLE+Huffman, RLE+Arithmetic (CPU).
-// Опційно: кадри з каталогу (колір), синтетичні нормалі / глибина.
+
+
 
 #include <algorithm>
 #include <cmath>
@@ -46,8 +46,8 @@ struct ChannelStats {
     int64_t raw_coeff_bytes = 0;
     int64_t rle_bytes = 0;
     int64_t huff_total = 0;
-    int64_t order0_bound = 0; // заголовок + ceil(H/8) (ідеальна межа)
-    int64_t arithmetic_actual = 0; // фактичний статичний order-0 range code (roundtrip)
+    int64_t order0_bound = 0; 
+    int64_t arithmetic_actual = 0; 
 };
 
 static void synth_normals_rgb(int w, int h, std::vector<uint8_t>& raw) {
@@ -235,7 +235,7 @@ static int self_test_bound() {
         std::cerr << "unexpected: Huffman total " << hlen << " < order0 bound " << bound << "\n";
         return 1;
     }
-    const int bound_ac = bound - 512 + 520; // той самий H, заголовок як у AC
+    const int bound_ac = bound - 512 + 520; 
     if (ac_len > bound_ac + 64) {
         std::cerr << "unexpected: AC actual " << ac_len << " >> bound_ac " << bound_ac << "\n";
         return 1;

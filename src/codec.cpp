@@ -97,7 +97,6 @@ struct PinnedCoeffs {
     ~PinnedCoeffs() {
         if (ptr) cuda_free_pinned_coeffs(ptr);
     }
-    // Delete copy, allow move
     PinnedCoeffs() = default;
     PinnedCoeffs(const PinnedCoeffs&) = delete;
     PinnedCoeffs& operator=(const PinnedCoeffs&) = delete;
@@ -291,7 +290,6 @@ void compress_flipbook(const std::string& in_dir, const std::string& out_path, i
                 h2d_current_already_queued = true;
             }
 
-            // Per-block RLE + Huffman pack + Huffman decode on GPU (bitstream matches OMP / huffman_decode_bit_window).
             for (int ch = 0; ch < img_ch; ++ch) {
                 const int num_blocks = (pw[ch] / block_size) * (ph[ch] / block_size);
                 void* stream = cuda_channel_stream_ptr(ch);

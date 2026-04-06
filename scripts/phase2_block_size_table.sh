@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Таблиця §4 Phase 2: flipbook_cuda compress для -b 8 / 16 / 32 (однакові кадри та -q).
+
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -31,7 +31,7 @@ for B in 8 16 32; do
   "$EXE" compress -q "$Q" -b "$B" "$FR_PATH" "$BIN" 2>&1 | tee "$LOG" | tail -n 3
   LINE=$(grep '\[BENCHMARK\]' "$LOG" || true)
   rm -f "$BIN" "$LOG"
-  # compress_ms=... compress_fps=... compressed_bytes=... compression_ratio=...
+
   CM=$(echo "$LINE" | sed -n 's/.*compress_ms=\([0-9.]*\).*/\1/p')
   FPS=$(echo "$LINE" | sed -n 's/.*compress_fps=\([0-9.]*\).*/\1/p')
   CB=$(echo "$LINE" | sed -n 's/.*compressed_bytes=\([0-9]*\).*/\1/p')

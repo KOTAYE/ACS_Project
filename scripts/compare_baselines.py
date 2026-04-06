@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+                      
+                      
 """Порівняння двох JSON з capture_baseline.py (відносні зміни %)."""
 from __future__ import annotations
 

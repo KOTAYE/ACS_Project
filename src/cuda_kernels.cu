@@ -26,11 +26,11 @@ __device__ __forceinline__ float ld_u8_as_float(const uint8_t* p) {
     return static_cast<float>(__ldg(p));
 }
 
-// Separable DCT-II / inverse matching src/dct.cpp (dct2d_separable / idct2d_separable).
-// Single __device__ implementation shared by encode/decode (no duplicate IDCT logic).
-// Encode/decode kernels keep all BS×BS temporaries in __shared__ (3× BS² floats) to cut register
-// pressure. Shared bytes per CUDA block = 12×BS² (float). Launch: one thread per macroblock (<<<grid,1>>>),
-// so warp occupancy is low by design; larger BS (e.g. 32) raises smem/block — see docs/BLOCK_SIZE_SCALING.md.
+
+
+
+
+
 
 template<int BS>
 __device__ void dct2d_device(const float* __restrict__ in, float* __restrict__ out, float* __restrict__ shared) {
@@ -162,7 +162,7 @@ __global__ void decode_blocks_kernel(
     float* s_spat  = s_buf + BS * BS;
     float* s_tmp   = s_buf + 2 * BS * BS;
 
-    // coeff[zigzag[k]] holds quant of natural DCT bin k (see encode_blocks_kernel).
+    
     for (int j = 0; j < BS * BS; ++j) {
         s_coeff[j] = static_cast<float>(coeff_in[block_idx * BS * BS + zigzag[j]]) * qm[j];
     }
@@ -192,13 +192,13 @@ struct ChannelBuf {
     int16_t *d_coeff = nullptr;
     size_t pixels = 0, coeffs = 0;
     
-    // Entropy state
+    
     int16_t* d_rle = nullptr;
     size_t rle_len = 0;
     uint8_t* d_packed = nullptr;
     size_t packed_bytes = 0;
 
-    // Per-block indexing
+    
     uint32_t* d_block_bit_lengths = nullptr;
     int pw = 0, ph = 0;
 };
@@ -299,7 +299,7 @@ void cuda_free_frame_buffers() {
         cudaFree(b.d_prev);
         cudaFree(b.d_curr); cudaFree(b.d_coeff);
         cudaFree(b.d_block_bit_lengths);
-        // Note: d_packed and d_rle are managed by rle_gpu_init/cleanup
+        
         g_ch[ch] = {};
     }
     for (auto& p : g_d_qm) { cudaFree(p); p = nullptr; }
@@ -315,7 +315,7 @@ void cuda_free_frame_buffers() {
 
 void cuda_submit_frame_h2d(int frame_index, const uint8_t* ptr[3], int channels) {
     const int slot = frame_index % 2;
-    // Повторне використання device d_src[slot]: попередній кадр з цим slot уже закінчив encode.
+    
     if (frame_index >= 2)
         CUDA_CHECK(cudaStreamWaitEvent(g_transfer_stream, g_evt_encode_slot_done[slot]));
 
@@ -332,8 +332,8 @@ void cuda_submit_frame_h2d(int frame_index, const uint8_t* ptr[3], int channels)
 }
 
 void cuda_download_planes(uint8_t* ptr[3], int channels) {
-    // Decode kernels run on g_stream[*]; copies use g_transfer_stream — full device sync
-    // ensures d_curr writes are visible before D2H (avoids stale/zeroed reads on some setups).
+    
+    
     CUDA_CHECK(cudaDeviceSynchronize());
     size_t offset = 0;
     for (int ch = 0; ch < channels; ++ch) {
@@ -475,7 +475,7 @@ void cuda_full_decode_channel(int ch,
     auto  stream = g_stream[ch];
     const float* qm = (ch == 0) ? g_d_qm[0] : g_d_qm[1];
 
-    // GPU entropy decode: Huffman → RLE → coefficients (in ctx.d_final_out)
+    
     cuda_gpu_decode_entropy(ch, h_packed_data, packed_bytes,
                             h_block_bit_lengths, num_blocks, h_freq, block_size, stream);
 
@@ -484,7 +484,7 @@ void cuda_full_decode_channel(int ch,
     CUDA_CHECK(cudaMemcpyAsync(buf.d_coeff, decoded,
                total_coeffs * sizeof(int16_t), cudaMemcpyDeviceToDevice, stream));
 
-    // Run IDCT kernel
+    
     dim3 grid(pw / block_size, ph / block_size);
     const size_t shared_mem = 3u * (size_t)block_size * (size_t)block_size * sizeof(float);
 

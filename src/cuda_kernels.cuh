@@ -12,12 +12,12 @@ void cuda_free_frame_buffers();
 int16_t* cuda_alloc_pinned_coeffs(size_t num_elements);
 void cuda_free_pinned_coeffs(int16_t* ptr);
 
-// H→D: pinned staging (2× ping-pong) + async copy on g_transfer_stream; overlaps with encode on g_stream[*].
+
 void cuda_submit_frame_h2d(int frame_index, const uint8_t* ptr[3], int channels);
 void cuda_download_planes(uint8_t* ptr[3], int channels);
 
 void cuda_encode_channel(int ch, int pw, int ph, int block_size, bool is_keyframe, int src_slot);
-// Після останнього encode кадру (той самий src_slot): позначити, що device d_src[slot] вільний для наступного H2D.
+
 void cuda_record_encode_slot_done(int slot, int last_ch);
 void cuda_download_coeffs(int ch, int16_t* host_dst, int num_coeffs);
 void cuda_rle_channel(int ch, int pw, int ph, int block_size, uint32_t* out_rle_bytes);

@@ -7,7 +7,7 @@
 #include <vector>
 
 int arithmetic_order0_bound_total_bytes(const uint8_t* data, int len) {
-    // Теоретична межа при тому ж розмірі блоку частот, що й Huffman (512 B).
+    
     constexpr int kHeader = 512;
     if (len <= 0) return kHeader;
 
@@ -27,14 +27,14 @@ int arithmetic_order0_bound_total_bytes(const uint8_t* data, int len) {
 
 namespace {
 
-constexpr int kModelTotal = 65536; // сума масштабованих частот для стабільного ділення
+constexpr int kModelTotal = 65536; 
 
 void build_histogram(const uint8_t* data, int len, uint32_t raw[256]) {
     std::memset(raw, 0, 256 * sizeof(uint32_t));
     for (int i = 0; i < len; ++i) ++raw[data[i]];
 }
 
-// Масштабує частоти до суми kModelTotal; нульові лишаються нулями.
+
 void scale_to_model(const uint32_t raw[256], uint16_t scaled[256]) {
     uint64_t sum = 0;
     for (int i = 0; i < 256; ++i) sum += raw[i];
@@ -156,11 +156,11 @@ void range_decode_bytes(ByteReader& r, const uint32_t cum[257], int out_len, uin
     }
 }
 
-} // namespace
+} 
 
 int arithmetic_order0_encode(const uint8_t* data, int len, std::vector<uint8_t>& out) {
     out.clear();
-    constexpr int kHdr = 8 + 512; // magic+len + uint16×256 scaled model
+    constexpr int kHdr = 8 + 512; 
     out.resize(kHdr);
     std::memcpy(out.data(), "ARQ0", 4);
     *reinterpret_cast<int32_t*>(out.data() + 4) = len;

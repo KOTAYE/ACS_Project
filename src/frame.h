@@ -11,8 +11,8 @@
         return ((n + align - 1) / align) * align;
     }
 
-    // Планарне сховище каналів: один uint8_t на піксель (після паддінгу). Це формат, що йде на GPU
-    // (cudaMemcpy H→D: рівно padded_w×padded_h байт на канал), без float на шині PCIe.
+    
+    
     struct Frame {
         int width = 0;
         int height = 0;

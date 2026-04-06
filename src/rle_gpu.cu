@@ -4,8 +4,6 @@
 #include <cub/cub.cuh>
 #include <cstring>
 #include <iostream>
-// Per-block Huffman bitstream: Step A = HuffmanBlockBitLengthKernel, Step B = CUB ExclusiveSum,
-// Step C = HuffmanPackAllBlocksSerialKernel (see docs/GPU_HUFFMAN_BITSTREAM.md).
 
 #define CUDA_CHECK(call) \
     do { \
@@ -41,7 +39,6 @@ struct RleContext {
 
     size_t rle_len_bytes = 0;
 
-    // Decode-specific fields
     GpuHuffNode* d_decode_tree = nullptr;
     uint8_t*     d_decode_packed = nullptr;
     size_t       decode_packed_cap = 0;
@@ -58,7 +55,6 @@ struct HuffTreeBuildNode {
     uint32_t count;
 };
 
-// Same tree shape as huffman.cpp build_tree(freq) for uint16_t frequencies.
 static int build_huffman_tree_u16(const uint16_t* freq, HuffTreeBuildNode* nodes, int* out_num_nodes) {
     int num_nodes = 0;
     int roots[256];
@@ -122,9 +118,6 @@ static void ht_to_gpu_nodes(const HuffTreeBuildNode* nodes, int num_nodes, GpuHu
     }
 }
 
-// ----------------------------------------------------------------------------
-// Step 5: Per-block Kernels
-// ----------------------------------------------------------------------------
 
 __global__ void RleCountPerBlockKernel(const int16_t* in, int num_blocks, int block_size_sq, int* counts) {
     int bid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -137,10 +130,10 @@ __global__ void RleCountPerBlockKernel(const int16_t* in, int num_blocks, int bl
         if (b_ptr[i] == 0) {
             int run = 1;
             while (i + run < block_size_sq && b_ptr[i + run] == 0 && run < 32767) run++;
-            output_elems += 2; // zero marker + run length
+            output_elems += 2;
             i += run;
         } else {
-            output_elems += 1; // single non-zero value
+            output_elems += 1;
             i++;
         }
     }
@@ -185,7 +178,6 @@ __global__ void HuffmanBlockBitLengthKernel(const int16_t* rle_in, const int* rl
     bit_lengths[bid] = total_bits;
 }
 
-// Same bit layout as huffman.cpp write_bits / write_bit (MSB of codeword first, bit index within stream).
 __device__ void dev_write_huff_bits(uint8_t* out, uint32_t& global_bit_off, uint32_t code, int n) {
     for (int i = n - 1; i >= 0; --i) {
         const int bit = (int)((code >> i) & 1u);
@@ -196,8 +188,6 @@ __device__ void dev_write_huff_bits(uint8_t* out, uint32_t& global_bit_off, uint
     }
 }
 
-// One thread packs all blocks in order. Parallel <<<num_blocks,1>>> races when adjacent blocks share a byte
-// (bit ranges are disjoint but byte writes use |= without atomics).
 __global__ void HuffmanPackAllBlocksSerialKernel(const int16_t* rle_in, const int* rle_offsets, const int* rle_counts,
                                                  int num_blocks, const uint32_t* bits, const uint8_t* lens,
                                                  const uint32_t* bit_offsets, uint8_t* out) {
@@ -224,8 +214,6 @@ __global__ void HuffmanHistKernel(const uint8_t* in, int n, uint32_t* hist) {
     if (i < n) atomicAdd(&hist[in[i]], 1);
 }
 
-// ─── GPU Decode Kernels ─────────────────────────────────────────────────
-
 __device__ int gpu_read_bit(const uint8_t* stream, uint32_t bit_pos) {
     return (stream[bit_pos >> 3] >> (7 - (bit_pos & 7))) & 1;
 }
@@ -234,7 +222,6 @@ __device__ bool gpu_huff_is_leaf(const GpuHuffNode* tree, int n) {
     return tree[n].children[0] < 0 && tree[n].children[1] < 0;
 }
 
-// Matches huffman.cpp huffman_decode_bit_window: root-leaf consumes code_len bits (forced to 1 for single-symbol tree).
 __global__ void HuffmanDecodePerBlockKernel(
     const uint8_t* __restrict__ bitstream,
     const uint32_t* __restrict__ bit_starts,
@@ -378,7 +365,7 @@ void rle_gpu_init(int ch, size_t max_elements) {
     }
     
     ctx.capacity = max_elements;
-    int max_blocks = (max_elements + 63) / 64; // Approx for 8x8 blocks
+    int max_blocks = (max_elements + 63) / 64;
 
     CUDA_CHECK(cudaMalloc(&ctx.d_unique, max_elements * sizeof(int16_t)));
     CUDA_CHECK(cudaMalloc(&ctx.d_counts, max_elements * sizeof(int)));
@@ -407,7 +394,6 @@ void rle_gpu_init(int ch, size_t max_elements) {
     CUDA_CHECK(cudaMalloc(&ctx.d_decode_packed, kInitialPacked));
     ctx.decode_packed_cap = kInitialPacked;
 
-    // We'll use ExclusiveSum for various things, so find max required temp storage
     size_t rb1 = 0;
     cub::DeviceScan::ExclusiveSum(nullptr, rb1, (int*)nullptr, (int*)nullptr, (int)max_elements, nullptr);
     size_t rb2 = 0;
