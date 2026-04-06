@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Nsight Systems: timeline (CUDA API, kernels, memcpy, CPU–GPU gaps).
-# Потрібні: nsys у PATH (NVIDIA Nsight Systems).
+
+
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"

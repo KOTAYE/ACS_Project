@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Повний прогін: збірка, self-tests, round-trip (CUDA/OMP/Serial), легкий бенчмарк,
-# metrics.json, графіки в charts/, JSON розмірів блоків DCT.
+
+
 set -euo pipefail
-# Щоб кирилиця в echo не перетворювалась на "????" у терміналі без UTF-8
+
 export LC_ALL=C.UTF-8 LANG=C.UTF-8 2>/dev/null || true
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -63,7 +63,7 @@ echo "Serial compress/decompress…"
 echo ""
 echo "=== [4/6] Легкий бенчмарк (GPU+CPU, q ∈ {40,50,70,100}) → $RESULTS ==="
 mkdir -p "$RESULTS"
-# Щоб compute_metrics не змішував кадри з попередніх прогонів (інша кількість/розмір)
+
 rm -rf "$RESULTS"/gpu_q*_recon "$RESULTS"/cpu_q*_recon
 rm -f "$RESULTS"/gpu_compress_q*.log "$RESULTS"/gpu_decompress_q*.log \
       "$RESULTS"/cpu_compress_q*.log "$RESULTS"/cpu_decompress_q*.log

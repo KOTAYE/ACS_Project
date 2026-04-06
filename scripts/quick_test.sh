@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build + minimal GPU round-trip + PSNR (CUDA + Python3 + Pillow)
+
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"

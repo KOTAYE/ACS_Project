@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Порівняння швидкості стиснення для -b 8 / 16 / 32 (однакові кадри та якість).
+
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"

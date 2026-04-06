@@ -2,7 +2,7 @@
 
 #include <vector>
 
-/** Same diagonal scan as CUDA encode (must match generate_zigzag in codec history). */
+
 inline std::vector<int> codec_zigzag_scan_table(int n) {
     std::vector<int> zigzag(n * n);
     int i = 0, j = 0;

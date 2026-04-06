@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+                      
+                      
 """Графік compress_fps та compression_ratio для -b 8/16/32 (flipbook_cuda)."""
 import json
 import os

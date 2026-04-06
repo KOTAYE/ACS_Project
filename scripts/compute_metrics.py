@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+                      
+                      
 """Compute PSNR and SSIM between original frames and reconstructed frames."""
 import sys, os, json, glob, re
 import numpy as np
@@ -16,7 +18,7 @@ def load_image(path):
         return np.array(Image.open(path))
     except ImportError:
         import subprocess
-        # Fallback: use stb via a tiny C program, or just skip
+                                                              
         raise
 
 def compute_psnr(a, b):
@@ -100,7 +102,7 @@ def main():
             key = f"{impl}_q{q}"
             recon_dir = os.path.join(results_dir, f"{key}_recon")
             
-            # Parse benchmark logs
+                                  
             compress_log = parse_benchmark_log(os.path.join(results_dir, f"{impl}_compress_q{q}.log"))
             decompress_log = parse_benchmark_log(os.path.join(results_dir, f"{impl}_decompress_q{q}.log"))
             
@@ -129,7 +131,7 @@ def main():
                         orig_img = load_image(orig_frames[i])
                         recon_img = load_image(recon_frames[i])
                         
-                        # Resize if needed
+                                          
                         if orig_img.shape != recon_img.shape:
                             min_h = min(orig_img.shape[0], recon_img.shape[0])
                             min_w = min(orig_img.shape[1], recon_img.shape[1])

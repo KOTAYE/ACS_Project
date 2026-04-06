@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+                      
+                      
 """Generate publication-quality comparison charts from real benchmark data."""
 import sys, os, json
 import matplotlib
@@ -190,7 +192,7 @@ def chart6_rate_distortion(data, out_dir):
             if key in data and "avg_psnr" in data[key] and "compressed_bytes" in data[key] and "raw_bytes" in data[key]:
                 raw = data[key]["raw_bytes"]
                 comp = data[key]["compressed_bytes"]
-                # Assume 8 bits per pixel originally
+                                                    
                 bpp = 8.0 * comp / raw
                 bpp_vals.append(bpp)
                 psnr_vals.append(data[key]["avg_psnr"])

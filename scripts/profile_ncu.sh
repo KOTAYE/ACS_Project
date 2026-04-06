@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Nsight Compute: метрики ядер (регістри, occupancy, memory throughput).
-# Потрібні: ncu у PATH.
+
+
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"

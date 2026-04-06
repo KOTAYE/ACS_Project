@@ -47,7 +47,7 @@ inline void level_shift_n(float* b, int n, float d) {
     for (int i = 0; i < n; ++i) b[i] += d;
 }
 
-} // namespace
+} 
 
 std::vector<int16_t> rle_encode_zeros(const std::vector<int16_t>& in) {
     std::vector<int16_t> out;
@@ -86,7 +86,7 @@ void rle_decode_zeros(const std::vector<int16_t>& in, std::vector<int16_t>& out)
     }
 }
 
-// Per-block RLE (same semantics as GPU RleDecodePerBlockKernel).
+
 static void rle_decode_macroblock(const int16_t* rle, int rle_elem_count, int16_t* coef_out, int bs2) {
     int in_idx = 0, out_idx = 0;
     while (in_idx < rle_elem_count && out_idx < bs2) {

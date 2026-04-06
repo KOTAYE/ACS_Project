@@ -7,7 +7,7 @@
 #include <mutex>
 #include <unordered_map>
 
-/** Збирає кадри з паралельних парсерів і видає їх GPU у порядку зростання індекса. */
+
 class OrderedFrameBuffer {
 public:
     void push(size_t index, Frame frame) {
@@ -27,7 +27,7 @@ public:
         return failed_;
     }
 
-    /** Блокує до появи кадру index або глобальної помилки. Повертає false при fail. */
+    
     bool wait_take(size_t index, Frame& out) {
         std::unique_lock<std::mutex> lk(mu_);
         cv_.wait(lk, [&] { return ready_.count(index) != 0 || failed_; });

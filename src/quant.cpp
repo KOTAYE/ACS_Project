@@ -10,7 +10,7 @@ QuantMatrix make_quant_matrix(const QuantMatrix8& base, int quality, int block_s
     if (block_size == 8) {
         for (int i = 0; i < 64; ++i) qm[i] = std::clamp(std::roundf(base[i] * scale), 1.0f, 255.0f);
     } else {
-        // Bilinear interpolation from 8x8 to block_size x block_size
+        
         float step = 7.0f / (block_size - 1);
         for (int r = 0; r < block_size; ++r) {
             for (int c = 0; c < block_size; ++c) {
