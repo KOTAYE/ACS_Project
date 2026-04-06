@@ -1,11 +1,13 @@
 #pragma once
 
+#include <vector>
 #include <array>
 #include <cstdint>
 
-using QuantMatrix = std::array<float, 64>;
+using QuantMatrix = std::vector<float>;
+using QuantMatrix8 = std::array<float, 64>;
 
-constexpr QuantMatrix kJpegLumaQuant = {
+constexpr QuantMatrix8 kJpegLumaQuant = {
     16, 11, 10, 16, 24, 40, 51, 61,
     12, 12, 14, 19, 26, 58, 60, 55,
     14, 13, 16, 24, 40, 57, 69, 56,
@@ -16,7 +18,7 @@ constexpr QuantMatrix kJpegLumaQuant = {
     72, 92, 95, 98,112,100,103, 99
 };
 
-constexpr QuantMatrix kJpegChromaQuant = {
+constexpr QuantMatrix8 kJpegChromaQuant = {
     17, 18, 24, 47, 99, 99, 99, 99,
     18, 21, 26, 66, 99, 99, 99, 99,
     24, 26, 56, 99, 99, 99, 99, 99,
@@ -27,7 +29,7 @@ constexpr QuantMatrix kJpegChromaQuant = {
     99, 99, 99, 99, 99, 99, 99, 99
 };
 
-QuantMatrix make_quant_matrix(const QuantMatrix& base, int quality);
+QuantMatrix make_quant_matrix(const QuantMatrix8& base, int quality, int block_size = 8);
 
-void quantize_block_64  (float block[64], const QuantMatrix& qm);
-void dequantize_block_64(float block[64], const QuantMatrix& qm);
+void quantize_block  (float* block, const QuantMatrix& qm, int size);
+void dequantize_block(float* block, const QuantMatrix& qm, int size);

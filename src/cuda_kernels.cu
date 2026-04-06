@@ -1,7 +1,9 @@
 #include "cuda_kernels.cuh"
+#include "rle_gpu.cuh"
 
 #include <cstdio>
 #include <cmath>
+#include <cstring>
 #include <utility>
 #include <cuda_runtime.h>
 
@@ -18,305 +20,273 @@
             exit(EXIT_FAILURE);                                                 \
         }                                                                       \
     } while (0)
+#define M_PI_F 3.14159265358979323846f
 
-
-__constant__ float d_cos[8][8] = {
-    {1.0000000000f, 1.0000000000f, 1.0000000000f, 1.0000000000f, 1.0000000000f, 1.0000000000f, 1.0000000000f, 1.0000000000f},
-    {0.9807852804f, 0.8314696123f, 0.5555702330f, 0.1950903220f, -0.1950903220f, -0.5555702330f, -0.8314696123f, -0.9807852804f},
-    {0.9238795325f, 0.3826834324f, -0.3826834324f, -0.9238795325f, -0.9238795325f, -0.3826834324f, 0.3826834324f, 0.9238795325f},
-    {0.8314696123f, -0.1950903220f, -0.9807852804f, -0.5555702330f, 0.5555702330f, 0.9807852804f, 0.1950903220f, -0.8314696123f},
-    {0.7071067812f, -0.7071067812f, -0.7071067812f, 0.7071067812f, 0.7071067812f, -0.7071067812f, -0.7071067812f, 0.7071067812f},
-    {0.5555702330f, -0.9807852804f, 0.1950903220f, 0.8314696123f, -0.8314696123f, -0.1950903220f, 0.9807852804f, -0.5555702330f},
-    {0.3826834324f, -0.9238795325f, 0.9238795325f, -0.3826834324f, -0.3826834324f, 0.9238795325f, -0.9238795325f, 0.3826834324f},
-    {0.1950903220f, -0.5555702330f, 0.8314696123f, -0.9807852804f, 0.9807852804f, -0.8314696123f, 0.5555702330f, -0.1950903220f}
-};
-
-__constant__ int d_zigzag[64] = {
-     0,  1,  5,  6, 14, 15, 27, 28,
-     2,  4,  7, 13, 16, 26, 29, 42,
-     3,  8, 12, 17, 25, 30, 41, 43,
-     9, 11, 18, 24, 31, 40, 44, 53,
-    10, 19, 23, 32, 39, 45, 52, 54,
-    20, 22, 33, 38, 46, 51, 55, 60,
-    21, 34, 37, 47, 50, 56, 59, 61,
-    35, 36, 48, 49, 57, 58, 62, 63
-};
-
-__device__ __forceinline__ float d_C(int u) {
-    return (u == 0) ? 0.70710678118f : 1.0f;
+__device__ __forceinline__ float ld_u8_as_float(const uint8_t* p) {
+    return static_cast<float>(__ldg(p));
 }
 
-static constexpr int TILES_PER_BLOCK = 4;
-static constexpr int THREADS_PER_BLK = TILES_PER_BLOCK * 64;
 
 
-__global__ void rgb_to_ycbcr_kernel(
-        const uint8_t* __restrict__ rgb,
-        float* __restrict__ y_plane,
-        float* __restrict__ cb_plane,
-        float* __restrict__ cr_plane,
-        int width, int height, int channels,
-        int pw_y, int pw_cb)
-{
-    const int x = blockIdx.x * blockDim.x + threadIdx.x;
-    const int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= width || y >= height) return;
 
-    const int idx = (y * width + x) * channels;
-    const float R = static_cast<float>(rgb[idx + 0]);
-    const float G = static_cast<float>(rgb[idx + 1]);
-    const float B = static_cast<float>(rgb[idx + 2]);
 
-    const float Y  =  0.299f * R + 0.587f * G + 0.114f * B;
-    const float Cb = -0.168736f * R - 0.331264f * G + 0.5f * B + 128.0f;
-    const float Cr =  0.5f * R - 0.418688f * G - 0.081312f * B + 128.0f;
 
-    y_plane[y * pw_y + x] = Y;
 
-    if ((x & 1) == 0 && (y & 1) == 0) {
-        cb_plane[(y / 2) * pw_cb + (x / 2)] = Cb;
-        cr_plane[(y / 2) * pw_cb + (x / 2)] = Cr;
+template<int BS>
+__device__ void dct2d_device(const float* __restrict__ in, float* __restrict__ out, float* __restrict__ shared) {
+    float* tmp = shared;
+    for (int r = 0; r < BS; ++r) {
+        const float* row_in = in + r * BS;
+        float* row_tmp = tmp + r * BS;
+        for (int k = 0; k < BS; ++k) {
+            float s = 0.f;
+            for (int n = 0; n < BS; ++n)
+                s += row_in[n] * cosf(M_PI_F * (2.0f * n + 1.0f) * k / (2.0f * BS));
+            float ck = (k == 0) ? 0.70710678118f : 1.0f;
+            row_tmp[k] = 0.5f * ck * s;
+        }
+    }
+    for (int c = 0; c < BS; ++c) {
+        for (int k = 0; k < BS; ++k) {
+            float s = 0.f;
+            for (int n = 0; n < BS; ++n)
+                s += tmp[n * BS + c] * cosf(M_PI_F * (2.0f * n + 1.0f) * k / (2.0f * BS));
+            float ck = (k == 0) ? 0.70710678118f : 1.0f;
+            out[k * BS + c] = 0.5f * ck * s;
+        }
     }
 }
 
-__global__ void ycbcr_to_rgb_kernel(
-        const float* __restrict__ y_plane,
-        const float* __restrict__ cb_plane,
-        const float* __restrict__ cr_plane,
-        uint8_t* __restrict__ rgb,
-        int width, int height, int channels,
-        int pw_y, int pw_cb)
-{
-    const int x = blockIdx.x * blockDim.x + threadIdx.x;
-    const int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= width || y >= height) return;
-
-    const float Y  = y_plane[y * pw_y + x];
-    const float Cb = cb_plane[(y / 2) * pw_cb + (x / 2)] - 128.0f;
-    const float Cr = cr_plane[(y / 2) * pw_cb + (x / 2)] - 128.0f;
-
-    const float R = Y + 1.402f * Cr;
-    const float G = Y - 0.344136f * Cb - 0.714136f * Cr;
-    const float B = Y + 1.772f * Cb;
-
-    const int idx = (y * width + x) * channels;
-    rgb[idx + 0] = static_cast<uint8_t>(fminf(fmaxf(R + 0.5f, 0.0f), 255.0f));
-    rgb[idx + 1] = static_cast<uint8_t>(fminf(fmaxf(G + 0.5f, 0.0f), 255.0f));
-    rgb[idx + 2] = static_cast<uint8_t>(fminf(fmaxf(B + 0.5f, 0.0f), 255.0f));
-    if (channels == 4) rgb[idx + 3] = 255;
+template<int BS>
+__device__ void idct2d_device(const float* __restrict__ in, float* __restrict__ out, float* __restrict__ shared) {
+    float* tmp = shared;
+    for (int c = 0; c < BS; ++c) {
+        for (int n = 0; n < BS; ++n) {
+            float s = 0.f;
+            for (int k = 0; k < BS; ++k) {
+                float ck = (k == 0) ? 0.70710678118f : 1.0f;
+                s += ck * in[k * BS + c] * cosf(M_PI_F * (2.0f * n + 1.0f) * k / (2.0f * BS));
+            }
+            tmp[n * BS + c] = 0.5f * s;
+        }
+    }
+    for (int r = 0; r < BS; ++r) {
+        const float* row_in = tmp + r * BS;
+        float* row_out = out + r * BS;
+        for (int n = 0; n < BS; ++n) {
+            float s = 0.f;
+            for (int k = 0; k < BS; ++k) {
+                float ck = (k == 0) ? 0.70710678118f : 1.0f;
+                s += ck * row_in[k] * cosf(M_PI_F * (2.0f * n + 1.0f) * k / (2.0f * BS));
+            }
+            row_out[n] = 0.5f * s;
+        }
+    }
 }
 
-
-__global__ void raw_to_planes_kernel(
-        const uint8_t* __restrict__ rgb,
-        float* __restrict__ planes[],
-        int width, int height, int channels, int padded_w)
-{
-    const int x = blockIdx.x * blockDim.x + threadIdx.x;
-    const int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= width || y >= height) return;
-    const int idx = (y * width + x) * channels;
-    for (int c = 0; c < channels; ++c)
-        planes[c][y * padded_w + x] = static_cast<float>(rgb[idx + c]);
-}
-
-__global__ void planes_to_raw_kernel(
-        float* const __restrict__ planes[],
-        uint8_t* __restrict__ rgb,
-        int width, int height, int channels, int padded_w)
-{
-    const int x = blockIdx.x * blockDim.x + threadIdx.x;
-    const int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= width || y >= height) return;
-    const int idx = (y * width + x) * channels;
-    for (int c = 0; c < channels; ++c)
-        rgb[idx + c] = static_cast<uint8_t>(fminf(fmaxf(planes[c][y * padded_w + x] + 0.5f, 0.0f), 255.0f));
-}
-
-
+template<int BS>
 __global__ void encode_blocks_kernel(
-        const float* __restrict__ src,
-        const float* __restrict__ prev,
-        float*       __restrict__ recon,
-        int16_t*     __restrict__ coeff_out,
-        const float* __restrict__ qm,
-        int padded_w, int blocks_x, int total_blocks,
-        bool is_keyframe)
+    const uint8_t* src, const uint8_t* prev, uint8_t* recon,
+    int16_t* coeffs, const float* qm, const int* zigzag,
+    int padded_w, int padded_h, bool is_keyframe)
 {
-    const int tile     = threadIdx.x >> 6;
-    const int tid      = threadIdx.x & 63;
-    const int block_id = blockIdx.x * TILES_PER_BLOCK + tile;
-    const bool active  = (block_id < total_blocks);
+    int bx = blockIdx.x;
+    int by = blockIdx.y;
+    int x0 = bx * BS;
+    int y0 = by * BS;
+    int grid_w = padded_w / BS;
+    int block_idx = by * grid_w + bx;
 
-    const int bx  = active ? (block_id % blocks_x) : 0;
-    const int by  = active ? (block_id / blocks_x) : 0;
-    const int row = tid >> 3, col = tid & 7;
-    const int px  = bx * 8 + col, py = by * 8 + row;
+    extern __shared__ float s_buf[];
+    float* s_blk = s_buf;
+    float* s_mid = s_buf + BS * BS;
+    float* s_tmp = s_buf + 2 * BS * BS;
 
-    __shared__ float s_blk[TILES_PER_BLOCK][64];
-    __shared__ float s_tmp[TILES_PER_BLOCK][64];
-
-    float val = 0.0f;
-    if (active) {
-        val = src[py * padded_w + px];
-        if (!is_keyframe) val -= prev[py * padded_w + px];
-        else              val -= 128.0f;
+    for (int r = 0; r < BS; ++r) {
+        for (int c = 0; c < BS; ++c) {
+            const int row = y0 + r;
+            const int col = x0 + c;
+            const int idx = row * padded_w + col;
+            const float val = ld_u8_as_float(src + idx);
+            if (!is_keyframe) {
+                const float pval = ld_u8_as_float(prev + idx);
+                s_blk[r * BS + c] = val - pval;
+            } else {
+                s_blk[r * BS + c] = val - 128.0f;
+            }
+        }
     }
-    s_blk[tile][tid] = val;
-    __syncthreads();
 
-    { float s = 0; for (int n = 0; n < 8; ++n) s += s_blk[tile][row*8+n] * d_cos[col][n];
-      s_tmp[tile][tid] = 0.5f * d_C(col) * s; }
-    __syncthreads();
+    dct2d_device<BS>(s_blk, s_mid, s_tmp);
 
-    { float s = 0; for (int n = 0; n < 8; ++n) s += s_tmp[tile][n*8+col] * d_cos[row][n];
-      s_blk[tile][tid] = 0.5f * d_C(row) * s; }
-    __syncthreads();
+    for (int i = 0; i < BS * BS; ++i) {
+        coeffs[block_idx * BS * BS + zigzag[i]] = static_cast<int16_t>(roundf(s_mid[i] / qm[i]));
+    }
 
-    const float qm_val = qm[tid];
-    const float q = roundf(s_blk[tile][tid] / qm_val);
-    s_blk[tile][tid] = q;
-    __syncthreads();
+    idct2d_device<BS>(s_mid, s_blk, s_tmp);
 
-    if (active) coeff_out[block_id * 64 + tid] = static_cast<int16_t>(s_blk[tile][d_zigzag[tid]]);
-    __syncthreads();
-
-    s_blk[tile][tid] = q * qm_val;
-    __syncthreads();
-
-    { float s = 0; for (int k = 0; k < 8; ++k) s += d_C(k) * s_blk[tile][k*8+col] * d_cos[k][row];
-      s_tmp[tile][tid] = 0.5f * s; }
-    __syncthreads();
-
-    { float s = 0; for (int k = 0; k < 8; ++k) s += d_C(k) * s_tmp[tile][row*8+k] * d_cos[k][col];
-      s_blk[tile][tid] = 0.5f * s; }
-    __syncthreads();
-
-    if (active) {
-        float r = s_blk[tile][tid];
-        if (!is_keyframe) r += prev[py * padded_w + px]; else r += 128.0f;
-        recon[py * padded_w + px] = r;
+    for (int r = 0; r < BS; ++r) {
+        for (int c = 0; c < BS; ++c) {
+            float rval = s_blk[r * BS + c];
+            const int row = y0 + r;
+            const int col = x0 + c;
+            const int idx = row * padded_w + col;
+            if (!is_keyframe) {
+                rval += ld_u8_as_float(prev + idx);
+            } else {
+                rval += 128.0f;
+            }
+            recon[idx] = static_cast<uint8_t>(fminf(fmaxf(roundf(rval), 0.0f), 255.0f));
+        }
     }
 }
 
-
+template<int BS>
 __global__ void decode_blocks_kernel(
         const int16_t* __restrict__ coeff_in,
-        const float*   __restrict__ prev,
-        float*         __restrict__ recon,
+        const uint8_t*   __restrict__ prev,
+        uint8_t*         __restrict__ recon,
         const float*   __restrict__ qm,
-        int padded_w, int blocks_x, int total_blocks,
-        bool is_keyframe)
+        const int*     __restrict__ zigzag,
+        int padded_w, int padded_h, bool is_keyframe)
 {
-    const int tile     = threadIdx.x >> 6;
-    const int tid      = threadIdx.x & 63;
-    const int block_id = blockIdx.x * TILES_PER_BLOCK + tile;
-    const bool active  = (block_id < total_blocks);
+    int bx = blockIdx.x;
+    int by = blockIdx.y;
+    int x0 = bx * BS;
+    int y0 = by * BS;
+    int grid_w = padded_w / BS;
+    int block_idx = by * grid_w + bx;
 
-    const int bx = active ? (block_id % blocks_x) : 0;
-    const int by = active ? (block_id / blocks_x) : 0;
-    const int row = tid >> 3, col = tid & 7;
+    extern __shared__ float s_buf[];
+    float* s_coeff = s_buf;
+    float* s_spat  = s_buf + BS * BS;
+    float* s_tmp   = s_buf + 2 * BS * BS;
 
-    __shared__ float s_blk[TILES_PER_BLOCK][64];
-    __shared__ float s_tmp[TILES_PER_BLOCK][64];
+    
+    for (int j = 0; j < BS * BS; ++j) {
+        s_coeff[j] = static_cast<float>(coeff_in[block_idx * BS * BS + zigzag[j]]) * qm[j];
+    }
 
-    float c = 0.0f;
-    if (active) c = static_cast<float>(coeff_in[block_id * 64 + tid]);
-    s_blk[tile][d_zigzag[tid]] = c;
-    __syncthreads();
+    idct2d_device<BS>(s_coeff, s_spat, s_tmp);
 
-    s_blk[tile][tid] *= qm[tid];
-    __syncthreads();
-
-    { float s = 0; for (int k = 0; k < 8; ++k) s += d_C(k) * s_blk[tile][k*8+col] * d_cos[k][row];
-      s_tmp[tile][tid] = 0.5f * s; }
-    __syncthreads();
-
-    { float s = 0; for (int k = 0; k < 8; ++k) s += d_C(k) * s_tmp[tile][row*8+k] * d_cos[k][col];
-      s_blk[tile][tid] = 0.5f * s; }
-    __syncthreads();
-
-    if (active) {
-        const int px = bx * 8 + col, py = by * 8 + row;
-        float v = s_blk[tile][tid];
-        if (!is_keyframe) v += prev[py * padded_w + px]; else v += 128.0f;
-        recon[py * padded_w + px] = v;
+    for (int r = 0; r < BS; ++r) {
+        for (int c = 0; c < BS; ++c) {
+            float rval = s_spat[r * BS + c];
+            const int row = y0 + r;
+            const int col = x0 + c;
+            const int idx = row * padded_w + col;
+            if (!is_keyframe) {
+                rval += ld_u8_as_float(prev + idx);
+            } else {
+                rval += 128.0f;
+            }
+            recon[idx] = static_cast<uint8_t>(fminf(fmaxf(roundf(rval), 0.0f), 255.0f));
+        }
     }
 }
 
 
 struct ChannelBuf {
-    float *d_src = nullptr, *d_prev = nullptr, *d_curr = nullptr;
+    uint8_t *d_src_ping[2] = {nullptr, nullptr};
+    uint8_t *d_prev = nullptr, *d_curr = nullptr;
     int16_t *d_coeff = nullptr;
     size_t pixels = 0, coeffs = 0;
+    
+    
+    int16_t* d_rle = nullptr;
+    size_t rle_len = 0;
+    uint8_t* d_packed = nullptr;
+    size_t packed_bytes = 0;
+
+    
+    uint32_t* d_block_bit_lengths = nullptr;
+    int pw = 0, ph = 0;
 };
 
 static constexpr int MAX_CH = 3;
 static ChannelBuf   g_ch[MAX_CH];
 static cudaStream_t g_stream[MAX_CH] = {};
+static cudaStream_t g_transfer_stream = nullptr;
 static float*       g_d_qm[2]       = {};
+static int*         g_d_zigzag      = nullptr;
 static int          g_num_ch         = 0;
 static bool         g_allocated      = false;
-static bool         g_use_ycbcr      = true;
 
-static int g_width = 0, g_height = 0, g_channels = 0;
+static int g_bs = 8;
 static int g_pw[MAX_CH] = {}, g_ph[MAX_CH] = {};
 
-static float** g_d_plane_ptrs = nullptr;
+static uint8_t* g_h_rgb_in  = nullptr;
+static uint8_t* g_h_rgb_out = nullptr;
+static size_t   g_total_bytes = 0;
+static cudaEvent_t g_evt_h2d_done[2]         = {};
+static cudaEvent_t g_evt_encode_slot_done[2] = {};
 
-static uint8_t* g_d_rgb_in  = nullptr;
-static uint8_t* g_d_rgb_out = nullptr;
-static size_t   g_rgb_bytes = 0;
+static inline int pad_bs(int n, int bs) { return ((n + bs - 1) / bs) * bs; }
 
-static inline int pad8(int n) { return ((n + 7) / 8) * 8; }
 
 
 void cuda_init() {
+    CUDA_CHECK(cudaSetDevice(0));
     for (int i = 0; i < MAX_CH; ++i)
         CUDA_CHECK(cudaStreamCreate(&g_stream[i]));
+    CUDA_CHECK(cudaStreamCreate(&g_transfer_stream));
 }
 
 void cuda_cleanup() {
     cuda_free_frame_buffers();
+    rle_gpu_cleanup();
     for (int i = 0; i < MAX_CH; ++i)
         if (g_stream[i]) { cudaStreamDestroy(g_stream[i]); g_stream[i] = nullptr; }
+    if (g_transfer_stream) { cudaStreamDestroy(g_transfer_stream); g_transfer_stream = nullptr; }
 }
 
 void cuda_alloc_frame_buffers(int width, int height, int channels,
                               const float* luma_qm, const float* chroma_qm,
-                              bool use_ycbcr) {
+                              const int* zigzag, bool use_ycbcr, int block_size) {
     if (g_allocated) cuda_free_frame_buffers();
-    g_num_ch = channels; g_width = width; g_height = height; g_channels = channels;
-    g_use_ycbcr = use_ycbcr;
+    g_num_ch = channels;
+    g_bs     = block_size;
 
+    int total_coeffs_per_block = block_size * block_size;
+    g_total_bytes = 0;
     for (int ch = 0; ch < channels; ++ch) {
         int w = width, h = height;
         if (use_ycbcr && ch > 0 && channels == 3) { w = (width+1)/2; h = (height+1)/2; }
-        g_pw[ch] = pad8(w); g_ph[ch] = pad8(h);
+        g_pw[ch] = pad_bs(w, block_size);
+        g_ph[ch] = pad_bs(h, block_size);
         auto& b = g_ch[ch];
         b.pixels = size_t(g_pw[ch]) * g_ph[ch];
-        b.coeffs = size_t(g_pw[ch]/8) * (g_ph[ch]/8) * 64;
-        CUDA_CHECK(cudaMalloc(&b.d_src,   b.pixels * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&b.d_prev,  b.pixels * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&b.d_curr,  b.pixels * sizeof(float)));
+        b.coeffs = size_t(g_pw[ch]/block_size) * (g_ph[ch]/block_size) * total_coeffs_per_block;
+        b.pw = g_pw[ch]; b.ph = g_ph[ch];
+        rle_gpu_init(ch, b.coeffs);
+        g_total_bytes += b.pixels;
+        
+        size_t bytes = b.pixels * sizeof(uint8_t);
+        CUDA_CHECK(cudaMalloc(&b.d_src_ping[0], bytes));
+        CUDA_CHECK(cudaMalloc(&b.d_src_ping[1], bytes));
+        CUDA_CHECK(cudaMalloc(&b.d_prev, bytes));
+        CUDA_CHECK(cudaMalloc(&b.d_curr, bytes));
+        CUDA_CHECK(cudaMemset(b.d_prev, 0, bytes));
+        CUDA_CHECK(cudaMemset(b.d_curr, 0, bytes));
         CUDA_CHECK(cudaMalloc(&b.d_coeff, b.coeffs * sizeof(int16_t)));
-        CUDA_CHECK(cudaMemset(b.d_src,  0, b.pixels * sizeof(float)));
-        CUDA_CHECK(cudaMemset(b.d_prev, 0, b.pixels * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&b.d_block_bit_lengths, (b.coeffs / (block_size * block_size)) * sizeof(uint32_t)));
     }
 
-    CUDA_CHECK(cudaMalloc(&g_d_qm[0], 64*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&g_d_qm[1], 64*sizeof(float)));
-    CUDA_CHECK(cudaMemcpy(g_d_qm[0], luma_qm,   64*sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(g_d_qm[1], chroma_qm, 64*sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMalloc(&g_d_qm[0], total_coeffs_per_block*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&g_d_qm[1], total_coeffs_per_block*sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(g_d_qm[0], luma_qm,   total_coeffs_per_block*sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(g_d_qm[1], chroma_qm, total_coeffs_per_block*sizeof(float), cudaMemcpyHostToDevice));
+    
+    CUDA_CHECK(cudaMalloc(&g_d_zigzag, total_coeffs_per_block*sizeof(int)));
+    CUDA_CHECK(cudaMemcpy(g_d_zigzag, zigzag, total_coeffs_per_block*sizeof(int), cudaMemcpyHostToDevice));
 
-    g_rgb_bytes = size_t(width) * height * channels;
-    CUDA_CHECK(cudaMalloc(&g_d_rgb_in,  g_rgb_bytes));
-    CUDA_CHECK(cudaMalloc(&g_d_rgb_out, g_rgb_bytes));
+    CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&g_h_rgb_in),  2 * g_total_bytes, cudaHostAllocDefault));
+    CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&g_h_rgb_out), g_total_bytes, cudaHostAllocDefault));
 
-    float* h_plane_ptrs[MAX_CH];
-    for (int ch = 0; ch < channels; ++ch) h_plane_ptrs[ch] = g_ch[ch].d_src;
-    CUDA_CHECK(cudaMalloc(&g_d_plane_ptrs, MAX_CH * sizeof(float*)));
-    CUDA_CHECK(cudaMemcpy(g_d_plane_ptrs, h_plane_ptrs, channels * sizeof(float*), cudaMemcpyHostToDevice));
+    for (int s = 0; s < 2; ++s) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&g_evt_h2d_done[s], cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&g_evt_encode_slot_done[s], cudaEventDisableTiming));
+    }
 
     g_allocated = true;
 }
@@ -324,102 +294,155 @@ void cuda_alloc_frame_buffers(int width, int height, int channels,
 void cuda_free_frame_buffers() {
     if (!g_allocated) return;
     for (int ch = 0; ch < g_num_ch; ++ch) {
-        cudaFree(g_ch[ch].d_src);  cudaFree(g_ch[ch].d_prev);
-        cudaFree(g_ch[ch].d_curr); cudaFree(g_ch[ch].d_coeff);
+        auto& b = g_ch[ch];
+        cudaFree(b.d_src_ping[0]); cudaFree(b.d_src_ping[1]);
+        cudaFree(b.d_prev);
+        cudaFree(b.d_curr); cudaFree(b.d_coeff);
+        cudaFree(b.d_block_bit_lengths);
+        
         g_ch[ch] = {};
     }
     for (auto& p : g_d_qm) { cudaFree(p); p = nullptr; }
-    cudaFree(g_d_rgb_in);  g_d_rgb_in  = nullptr;
-    cudaFree(g_d_rgb_out); g_d_rgb_out = nullptr;
-    if (g_d_plane_ptrs) { cudaFree(g_d_plane_ptrs); g_d_plane_ptrs = nullptr; }
+    if (g_d_zigzag) { cudaFree(g_d_zigzag); g_d_zigzag = nullptr; }
+    if (g_h_rgb_in)  { cudaFreeHost(g_h_rgb_in);  g_h_rgb_in  = nullptr; }
+    if (g_h_rgb_out) { cudaFreeHost(g_h_rgb_out); g_h_rgb_out = nullptr; }
+    for (int s = 0; s < 2; ++s) {
+        if (g_evt_h2d_done[s])         { cudaEventDestroy(g_evt_h2d_done[s]);         g_evt_h2d_done[s]         = {}; }
+        if (g_evt_encode_slot_done[s]) { cudaEventDestroy(g_evt_encode_slot_done[s]); g_evt_encode_slot_done[s] = {}; }
+    }
     g_allocated = false;
 }
 
+void cuda_submit_frame_h2d(int frame_index, const uint8_t* ptr[3], int channels) {
+    const int slot = frame_index % 2;
+    
+    if (frame_index >= 2)
+        CUDA_CHECK(cudaStreamWaitEvent(g_transfer_stream, g_evt_encode_slot_done[slot]));
 
-void cuda_upload_and_convert_rgb(const uint8_t* rgb_host,
-                                 int width, int height, int channels) {
-    CUDA_CHECK(cudaMemcpy(g_d_rgb_in, rgb_host, g_rgb_bytes, cudaMemcpyHostToDevice));
-
-    dim3 block(16, 16);
-    dim3 grid((width + 15) / 16, (height + 15) / 16);
-
-    if (g_use_ycbcr && channels >= 3) {
-        rgb_to_ycbcr_kernel<<<grid, block>>>(
-            g_d_rgb_in,
-            g_ch[0].d_src, g_ch[1].d_src, g_ch[2].d_src,
-            width, height, channels, g_pw[0], g_pw[1]);
-    } else {
-        raw_to_planes_kernel<<<grid, block>>>(
-            g_d_rgb_in, g_d_plane_ptrs,
-            width, height, channels, g_pw[0]);
+    uint8_t* pin_slot = g_h_rgb_in + slot * g_total_bytes;
+    size_t offset = 0;
+    for (int ch = 0; ch < channels; ++ch) {
+        size_t bytes = g_ch[ch].pixels * sizeof(uint8_t);
+        std::memcpy(pin_slot + offset, ptr[ch], bytes);
+        CUDA_CHECK(cudaMemcpyAsync(g_ch[ch].d_src_ping[slot], pin_slot + offset, bytes,
+                                   cudaMemcpyHostToDevice, g_transfer_stream));
+        offset += bytes;
     }
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaEventRecord(g_evt_h2d_done[slot], g_transfer_stream));
 }
 
+void cuda_download_planes(uint8_t* ptr[3], int channels) {
+    
+    
+    CUDA_CHECK(cudaDeviceSynchronize());
+    size_t offset = 0;
+    for (int ch = 0; ch < channels; ++ch) {
+        size_t bytes = g_ch[ch].pixels * sizeof(uint8_t);
+        CUDA_CHECK(cudaMemcpyAsync(g_h_rgb_out + offset, g_ch[ch].d_curr, bytes,
+                                   cudaMemcpyDeviceToHost, g_transfer_stream));
+        offset += bytes;
+    }
+    CUDA_CHECK(cudaStreamSynchronize(g_transfer_stream));
+    offset = 0;
+    for (int ch = 0; ch < channels; ++ch) {
+        size_t bytes = g_ch[ch].pixels * sizeof(uint8_t);
+        std::memcpy(ptr[ch], g_h_rgb_out + offset, bytes);
+        offset += bytes;
+    }
+}
 
-void cuda_encode_channel(int ch, int16_t* coeff_out,
-                         int padded_w, int padded_h, bool is_keyframe) {
+void cuda_download_coeffs(int ch, int16_t* host_dst, int num_coeffs) {
+    if (!host_dst || num_coeffs <= 0) return;
+    CUDA_CHECK(cudaMemcpy(host_dst, g_ch[ch].d_coeff, (size_t)num_coeffs * sizeof(int16_t),
+                          cudaMemcpyDeviceToHost));
+}
+
+void cuda_encode_channel(int ch, int pw, int ph, int block_size, bool is_keyframe, int src_slot) {
     auto& buf    = g_ch[ch];
     auto  stream = g_stream[ch];
     const float* qm = (ch == 0) ? g_d_qm[0] : g_d_qm[1];
+    const int s = src_slot & 1;
+    CUDA_CHECK(cudaStreamWaitEvent(stream, g_evt_h2d_done[s]));
 
-    const int bx = padded_w / 8, by = padded_h / 8;
-    const int total = bx * by;
-    const int grid  = (total + TILES_PER_BLOCK - 1) / TILES_PER_BLOCK;
+    uint8_t* d_src = buf.d_src_ping[s];
+    dim3 grid(pw / block_size, ph / block_size);
+    const size_t shared_mem = 3u * (size_t)block_size * (size_t)block_size * sizeof(float);
 
-    encode_blocks_kernel<<<grid, THREADS_PER_BLK, 0, stream>>>(
-        buf.d_src, buf.d_prev, buf.d_curr, buf.d_coeff,
-        qm, padded_w, bx, total, is_keyframe);
+    if (block_size == 8) {
+        encode_blocks_kernel<8><<<grid, 1, shared_mem, stream>>>(
+            d_src, buf.d_prev, buf.d_curr, buf.d_coeff, qm, g_d_zigzag, pw, ph, is_keyframe);
+    } else if (block_size == 16) {
+        encode_blocks_kernel<16><<<grid, 1, shared_mem, stream>>>(
+            d_src, buf.d_prev, buf.d_curr, buf.d_coeff, qm, g_d_zigzag, pw, ph, is_keyframe);
+    } else if (block_size == 32) {
+        encode_blocks_kernel<32><<<grid, 1, shared_mem, stream>>>(
+            d_src, buf.d_prev, buf.d_curr, buf.d_coeff, qm, g_d_zigzag, pw, ph, is_keyframe);
+    }
     CUDA_CHECK(cudaGetLastError());
-
-    CUDA_CHECK(cudaMemcpyAsync(coeff_out, buf.d_coeff,
-               buf.coeffs * sizeof(int16_t), cudaMemcpyDeviceToHost, stream));
 }
 
+void cuda_record_encode_slot_done(int slot, int last_ch) {
+    const int s = slot & 1;
+    const int lc = last_ch < 0 ? 0 : (last_ch > MAX_CH - 1 ? MAX_CH - 1 : last_ch);
+    CUDA_CHECK(cudaEventRecord(g_evt_encode_slot_done[s], g_stream[lc]));
+}
+
+void cuda_rle_channel_indexed(int ch, int num_blocks, int block_size, uint32_t* out_rle_bytes) {
+    auto& buf = g_ch[ch];
+    auto  stream = g_stream[ch];
+    cuda_rle_encode_indexed(ch, buf.d_coeff, num_blocks, block_size, out_rle_bytes, stream);
+}
+
+void cuda_hist_channel_new(int ch, uint32_t* h_hist) {
+    auto  stream = g_stream[ch];
+    cuda_compute_histogram(ch, h_hist, stream);
+}
+
+void cuda_rle_channel(int ch, int pw, int ph, int block_size, uint32_t* out_rle_elements) {
+    int num_blocks = (pw / block_size) * (ph / block_size);
+    cuda_rle_channel_indexed(ch, num_blocks, block_size, out_rle_elements);
+}
+
+void cuda_hist_channel(int ch, uint32_t h_hist[256]) {
+    cuda_hist_channel_new(ch, h_hist);
+}
+
+void cuda_pack_channel(int ch, const uint32_t h_code_bits[256], const uint8_t h_code_lens[256],
+                       uint8_t** d_packed_ptr, size_t* out_packed_bytes) {
+    auto& buf = g_ch[ch];
+    int num_blocks = (buf.pw / g_bs) * (buf.ph / g_bs);
+    cuda_pack_channel_indexed(ch, num_blocks, g_bs, h_code_bits, h_code_lens, d_packed_ptr, out_packed_bytes, nullptr);
+}
 
 void cuda_decode_channel(int ch, const int16_t* coeff_in,
-                         int padded_w, int padded_h, bool is_keyframe) {
+                         int pw, int ph, int block_size, bool is_keyframe) {
     auto& buf    = g_ch[ch];
     auto  stream = g_stream[ch];
     const float* qm = (ch == 0) ? g_d_qm[0] : g_d_qm[1];
 
-    const int bx = padded_w / 8, by = padded_h / 8;
-    const int total = bx * by;
-    const int grid  = (total + TILES_PER_BLOCK - 1) / TILES_PER_BLOCK;
-
+    int coeffs_to_copy = (pw / block_size) * (ph / block_size) * block_size * block_size;
     CUDA_CHECK(cudaMemcpyAsync(buf.d_coeff, coeff_in,
-               buf.coeffs * sizeof(int16_t), cudaMemcpyHostToDevice, stream));
+               coeffs_to_copy * sizeof(int16_t), cudaMemcpyHostToDevice, stream));
 
-    decode_blocks_kernel<<<grid, THREADS_PER_BLK, 0, stream>>>(
-        buf.d_coeff, buf.d_prev, buf.d_curr,
-        qm, padded_w, bx, total, is_keyframe);
-    CUDA_CHECK(cudaGetLastError());
-}
+    dim3 grid(pw / block_size, ph / block_size);
+    const size_t shared_mem = 3u * (size_t)block_size * (size_t)block_size * sizeof(float);
 
-
-void cuda_download_and_convert_rgb(uint8_t* rgb_host,
-                                   int width, int height, int channels) {
-    dim3 block(16, 16);
-    dim3 grid((width + 15) / 16, (height + 15) / 16);
-
-    if (g_use_ycbcr && channels >= 3) {
-        ycbcr_to_rgb_kernel<<<grid, block>>>(
-            g_ch[0].d_curr, g_ch[1].d_curr, g_ch[2].d_curr,
-            g_d_rgb_out, width, height, channels, g_pw[0], g_pw[1]);
-    } else {
-        float* h_plane_ptrs[MAX_CH];
-        for (int ch = 0; ch < g_num_ch; ++ch) h_plane_ptrs[ch] = g_ch[ch].d_curr;
-        CUDA_CHECK(cudaMemcpy(g_d_plane_ptrs, h_plane_ptrs, g_num_ch * sizeof(float*), cudaMemcpyHostToDevice));
-        planes_to_raw_kernel<<<grid, block>>>(
-            g_d_plane_ptrs, g_d_rgb_out,
-            width, height, channels, g_pw[0]);
+    if (block_size == 8) {
+        decode_blocks_kernel<8><<<grid, 1, shared_mem, stream>>>(
+            buf.d_coeff, buf.d_prev, buf.d_curr, qm, g_d_zigzag, pw, ph, is_keyframe);
+    } else if (block_size == 16) {
+        decode_blocks_kernel<16><<<grid, 1, shared_mem, stream>>>(
+            buf.d_coeff, buf.d_prev, buf.d_curr, qm, g_d_zigzag, pw, ph, is_keyframe);
+    } else if (block_size == 32) {
+        decode_blocks_kernel<32><<<grid, 1, shared_mem, stream>>>(
+            buf.d_coeff, buf.d_prev, buf.d_curr, qm, g_d_zigzag, pw, ph, is_keyframe);
     }
     CUDA_CHECK(cudaGetLastError());
-
-    CUDA_CHECK(cudaMemcpy(rgb_host, g_d_rgb_out, g_rgb_bytes, cudaMemcpyDeviceToHost));
 }
 
+int16_t* cuda_channel_d_coeff(int ch) { return g_allocated ? g_ch[ch].d_coeff : nullptr; }
+
+void* cuda_channel_stream_ptr(int ch) { return g_stream[ch]; }
 
 void cuda_swap_recon() {
     for (int ch = 0; ch < g_num_ch; ++ch)
@@ -428,3 +451,71 @@ void cuda_swap_recon() {
 
 void cuda_sync_channel(int ch) { CUDA_CHECK(cudaStreamSynchronize(g_stream[ch])); }
 void cuda_sync_all()           { for (int i = 0; i < g_num_ch; ++i) cuda_sync_channel(i); }
+
+int16_t* cuda_alloc_pinned_coeffs(size_t num_elements) {
+    int16_t* ptr = nullptr;
+    CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&ptr), num_elements * sizeof(int16_t), cudaHostAllocDefault));
+    return ptr;
+}
+
+void cuda_free_pinned_coeffs(int16_t* ptr) {
+    if (ptr) CUDA_CHECK(cudaFreeHost(ptr));
+}
+
+void cuda_memcpy_to_host(void* host_ptr, const void* device_ptr, size_t bytes) {
+    CUDA_CHECK(cudaMemcpy(host_ptr, device_ptr, bytes, cudaMemcpyDeviceToHost));
+}
+
+void cuda_full_decode_channel(int ch,
+                               const uint8_t* h_packed_data, size_t packed_bytes,
+                               const uint32_t* h_block_bit_lengths, int num_blocks,
+                               const uint16_t* h_freq,
+                               int pw, int ph, int block_size, bool is_keyframe) {
+    auto& buf    = g_ch[ch];
+    auto  stream = g_stream[ch];
+    const float* qm = (ch == 0) ? g_d_qm[0] : g_d_qm[1];
+
+    
+    cuda_gpu_decode_entropy(ch, h_packed_data, packed_bytes,
+                            h_block_bit_lengths, num_blocks, h_freq, block_size, stream);
+
+    int total_coeffs = num_blocks * block_size * block_size;
+    int16_t* decoded = cuda_get_decoded_coeffs(ch);
+    CUDA_CHECK(cudaMemcpyAsync(buf.d_coeff, decoded,
+               total_coeffs * sizeof(int16_t), cudaMemcpyDeviceToDevice, stream));
+
+    
+    dim3 grid(pw / block_size, ph / block_size);
+    const size_t shared_mem = 3u * (size_t)block_size * (size_t)block_size * sizeof(float);
+
+    if (block_size == 8) {
+        decode_blocks_kernel<8><<<grid, 1, shared_mem, stream>>>(
+            buf.d_coeff, buf.d_prev, buf.d_curr, qm, g_d_zigzag, pw, ph, is_keyframe);
+    } else if (block_size == 16) {
+        decode_blocks_kernel<16><<<grid, 1, shared_mem, stream>>>(
+            buf.d_coeff, buf.d_prev, buf.d_curr, qm, g_d_zigzag, pw, ph, is_keyframe);
+    } else if (block_size == 32) {
+        decode_blocks_kernel<32><<<grid, 1, shared_mem, stream>>>(
+            buf.d_coeff, buf.d_prev, buf.d_curr, qm, g_d_zigzag, pw, ph, is_keyframe);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void cuda_get_block_bit_lengths(int ch, int num_blocks, uint32_t* h_lengths) {
+    CUDA_CHECK(cudaMemcpy(h_lengths, g_ch[ch].d_block_bit_lengths, num_blocks * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+}
+
+void cuda_pack_channel_indexed(int ch, int num_blocks, int block_size,
+                               const uint32_t h_code_bits[256], const uint8_t h_code_lens[256],
+                               uint8_t** d_packed_ptr, size_t* out_packed_bytes,
+                               uint32_t* d_block_bit_lengths_ptr) {
+    auto& buf = g_ch[ch];
+    auto  stream = g_stream[ch];
+
+    cuda_huffman_pack_gpu_indexed(ch, num_blocks,
+                                  h_code_bits, h_code_lens, &buf.d_packed, &buf.packed_bytes, 
+                                  buf.d_block_bit_lengths, stream);
+    
+    *d_packed_ptr = buf.d_packed;
+    *out_packed_bytes = buf.packed_bytes;
+}
