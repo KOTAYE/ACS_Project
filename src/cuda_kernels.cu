@@ -290,7 +290,7 @@ struct GpuChannel {
         uint32_t pack_bytes;
         uint32_t num_blocks;
     } *h_metadata;
-    PinnedMetadata* d_metadata; // Phase 3: Device pointer for the same mapped memory
+    PinnedMetadata* d_metadata;
 };
 
 static constexpr int MAX_CH = 3;
@@ -363,7 +363,7 @@ void cuda_alloc_frame_buffers(int width, int height, int channels,
         size_t nb = (size_t)(pw / block_size) * (ph / block_size);
         CUDA_CHECK(cudaMalloc(&g_ch[i].d_block_bit_lengths, nb * sizeof(uint32_t)));
 
-        rle_gpu_init(i, pw * ph); // Correctly initialize RLE context for this channel
+        rle_gpu_init(i, pw * ph);
         CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&g_ch[i].h_metadata), sizeof(GpuChannel::PinnedMetadata), cudaHostAllocMapped));
         CUDA_CHECK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&g_ch[i].d_metadata), g_ch[i].h_metadata, 0));
         g_ch[i].h_metadata->num_blocks = (uint32_t)nb;
@@ -435,7 +435,6 @@ void cuda_submit_frame_h2d(int frame_index, const uint8_t* ptr[3], int channels)
 }
 
 void cuda_download_planes(uint8_t* ptr[3], int channels) {
-    
     
     CUDA_CHECK(cudaDeviceSynchronize());
     size_t offset = 0;
@@ -578,7 +577,7 @@ void cuda_full_decode_channel(int ch,
     auto  stream = g_stream[ch];
     const float* qm = (ch == 0) ? g_d_qm[0] : g_d_qm[1];
 
-    
+
     cuda_gpu_decode_entropy(ch, h_packed_data, packed_bytes,
                             h_block_bit_lengths, num_blocks, h_freq, block_size, stream);
 
@@ -587,7 +586,6 @@ void cuda_full_decode_channel(int ch,
     CUDA_CHECK(cudaMemcpyAsync(buf.d_coeff, decoded,
                total_coeffs * sizeof(int16_t), cudaMemcpyDeviceToDevice, stream));
 
-    
     dim3 grid(pw / block_size, ph / block_size);
     const size_t shared_mem = 3u * (size_t)block_size * (size_t)block_size * sizeof(float);
 

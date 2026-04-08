@@ -4,7 +4,6 @@ project(askProjectCUDA LANGUAGES CXX CUDA)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CUDA_STANDARD 17)
 
-# Target RTX 3070 (Ampere, sm_86) for native code generation
 set(CMAKE_CUDA_ARCHITECTURES 86)
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --use_fast_math")
 
@@ -30,7 +29,6 @@ add_library(tinyexr_c STATIC src/tinyexr_impl.cpp)
 target_include_directories(tinyexr_c PUBLIC ${CMAKE_SOURCE_DIR}/third_party)
 target_link_libraries(tinyexr_c PRIVATE ZLIB::ZLIB)
 
-# ── CUDA target ──────────────────────────────────────────────
 add_executable(flipbook_cuda
     src/main_cuda.cpp
     src/codec.cpp
@@ -42,7 +40,6 @@ target_include_directories(flipbook_cuda PRIVATE ${INC_DIRS})
 target_link_libraries(flipbook_cuda PRIVATE tinyexr_c)
 set_target_properties(flipbook_cuda PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
-# ── OpenMP target ────────────────────────────────────────────
 find_package(OpenMP REQUIRED COMPONENTS CXX)
 
 add_executable(flipbook_omp
@@ -54,7 +51,6 @@ target_include_directories(flipbook_omp PRIVATE ${INC_DIRS})
 target_compile_definitions(flipbook_omp PRIVATE USE_OMP)
 target_link_libraries(flipbook_omp PRIVATE OpenMP::OpenMP_CXX tinyexr_c)
 
-# ── Serial target (single-threaded) ─────────────────────────
 add_executable(flipbook_serial
     src/main_serial.cpp
     bench/codec_cpu.cpp
@@ -63,7 +59,6 @@ add_executable(flipbook_serial
 target_include_directories(flipbook_serial PRIVATE ${INC_DIRS})
 target_link_libraries(flipbook_serial PRIVATE tinyexr_c)
 
-# CPU reference: RLE / Huffman / arithmetic sizes (compression rate comparison)
 add_executable(entropy_reference
     bench/entropy_reference.cpp
     src/arithmetic_ref.cpp

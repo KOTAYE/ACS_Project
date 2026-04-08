@@ -1,19 +1,36 @@
-# Багатопотоковий конвеєр стиснення (flipbook_cuda)
+# Multi-threaded I/O Pipeline
 
-## Етапи
+Our codec uses a **Parallel Pipeline** to make sure the GPU is never waiting for the next image. We use a "Producer-Consumer" model with multiple threads.
 
-1. **I/O thread** — послідовно читає кожен кадр з диска в `std::vector<uint8_t>` (`read_file_bytes`), ставить завдання в **`ThreadSafeQueue<RawQueueJob>`**.
-2. **Пул парсерів** (`std::min(16, hardware_concurrency())`) — знімає сирі байти, **`stbi_load_from_memory`**, перевірка розмірів, **`rgb_to_planes_parallel`** → планарний `uint8_t` `Frame`, **`OrderedFrameBuffer::push(index, …)`**.
-3. **GPU thread** — **`OrderedFrameBuffer::wait_take(k, …)`** у порядку `k = 0,1,…` (дельта-кодування), далі той самий шлях: pinned H2D, CUDA streams, ранній H2D наступного кадру, RLE/Huffman на GPU.
+## Theoretical Architecture
 
-## Порядок кадрів
+The pipeline is split into three main stages that run at the same time:
 
-Паралельний парсинг змінює порядок завершення; **`OrderedFrameBuffer`** збирає кадри за індексом і блокує споживача до появи потрібного `k`, щоб гарантувати ту саму семантику, що й раніше.
+### 1. The I/O Thread (Producer)
+This thread does nothing but read raw bytes from the disk.
+- It finds all images in the folder.
+- It reads them into memory as fast as possible.
+- It puts these "raw jobs" into a **`ThreadSafeQueue`**.
 
-## Помилки
+### 2. The Parser Pool (Workers)
+We launch a pool of CPU threads (usually 8-16 threads depending on your CPU).
+- Each thread takes a raw image from the queue.
+- It decodes the format (PNG via `stb_image` or EXR via `tinyexr`).
+- It performs color conversion (RGB to YCbCr).
+- It pushes the ready-to-process frame into the **`OrderedFrameBuffer`**.
 
-Невдале читання/декод або невідповідність розмірів викликає **`set_fail()`**; очікування на кадр повертає `false`, GPU-потік завершує чергу кодування.
+### 3. The GPU Thread (Consumer)
+This is the main thread that talks to the CUDA API.
+- It waits for frames to appear in the `OrderedFrameBuffer`.
+- It takes them **in the correct order** (e.g., Frame 0, then 1, then 2).
+- It sends them to the GPU for compression.
 
-## EXR
+## Why use an Ordered Buffer?
+Since we parse images in parallel, Frame 5 might finish before Frame 2. However, for video compression (especially if we use delta-encoding), we need the frames in the right order. The **`OrderedFrameBuffer`** acts like a "sorting station" that holds Frame 5 until Frames 2, 3, and 4 are ready.
 
-За розширенням `.exr` використовується **TinyEXR** (v1.0.9, `third_party/tinyexr.h`) з **zlib**; float RGBA тонмапиться в uint8 (простий reinhard для значень > 1). Усі кадри в каталозі мають мати однакові `w/h/ch` після декоду (наприклад, лише EXR або лише PNG).
+## Scalability
+- **CPU Bound?** If decoding PNGs is too slow, you can increase the number of parser threads.
+- **I/O Bound?** If reading from HDD is the bottleneck, the GPU will wait. We recommend using an SSD for best results (490+ FPS).
+
+## Error Handling
+If any image fails to load (wrong size or corrupted file), the pipeline calls **`set_fail()`**. This immediately stops all other stages and prints an error message, preventing the program from crashing or saving a broken binary.

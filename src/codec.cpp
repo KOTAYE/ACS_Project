@@ -10,8 +10,21 @@
 #include <chrono>
 #include <thread>
 
+#include <cuda_runtime.h>
 #include "cuda_kernels.cuh"
 #include "rle_gpu.cuh"
+
+#ifndef CUDA_CHECK
+#define CUDA_CHECK(call)                                                       \
+    do {                                                                        \
+        cudaError_t err = (call);                                               \
+        if (err != cudaSuccess) {                                               \
+            fprintf(stderr, "CUDA error at %s:%d — %s\n",                      \
+                    __FILE__, __LINE__, cudaGetErrorString(err));               \
+            exit(EXIT_FAILURE);                                                 \
+        }                                                                       \
+    } while (0)
+#endif
 
 #include "frame.h"
 #include "image_io.h"
@@ -178,6 +191,14 @@ void compress_flipbook(const std::string& in_dir, const std::string& out_path, i
 
     std::cout << "Compressing " << frames.size() << " frames into " << out_path << "...\n";
     auto t_compress_start = std::chrono::high_resolution_clock::now();
+    uint64_t total_pixels = static_cast<uint64_t>(img_w) * img_h * img_ch * frames.size();
+
+    cudaEvent_t ev_start[3], ev_stop[3];
+    for (int i = 0; i < 3; ++i) {
+        CUDA_CHECK(cudaEventCreate(&ev_start[i]));
+        CUDA_CHECK(cudaEventCreate(&ev_stop[i]));
+    }
+    float ms_stage[3] = {0.0f, 0.0f, 0.0f};
 
     ThreadSafeQueue<EncodedFrame> encode_queue;
 
@@ -274,11 +295,13 @@ void compress_flipbook(const std::string& in_dir, const std::string& out_path, i
             ef.is_keyframe = (f_idx == 0);
             ef.channels.resize(img_ch);
 
+            CUDA_CHECK(cudaEventRecord(ev_start[0], 0));
             for (int ch = 0; ch < img_ch; ++ch) {
                 cuda_encode_channel(ch, pw[ch], ph[ch], block_size, ef.is_keyframe, src_slot);
                 if (ch + 1 == img_ch)
                     cuda_record_encode_slot_done(src_slot, ch);
             }
+            CUDA_CHECK(cudaEventRecord(ev_stop[0], 0));
 
             Frame f_next;
             const bool have_next_frame = (static_cast<size_t>(f_idx) + 1 < n_frames);
@@ -289,7 +312,7 @@ void compress_flipbook(const std::string& in_dir, const std::string& out_path, i
                 h2d_current_already_queued = true;
             }
 
-            // Pass 1: Launch all kernels asynchronously for all channels
+            CUDA_CHECK(cudaEventRecord(ev_start[1], 0));
             for (int ch = 0; ch < img_ch; ++ch) {
                 const int num_blocks = (pw[ch] / block_size) * (ph[ch] / block_size);
                 void* stream = cuda_channel_stream_ptr(ch);
@@ -299,11 +322,14 @@ void compress_flipbook(const std::string& in_dir, const std::string& out_path, i
                 cuda_prepare_huffman_codebook_gpu(ch, stream);
                 cuda_pack_channel_indexed(ch, num_blocks, block_size, nullptr, nullptr, nullptr, nullptr, nullptr);
             }
+            CUDA_CHECK(cudaEventRecord(ev_stop[1], 0));
 
-            // PASS 2: Wait for all work to complete (One single sync per frame)
             cuda_sync_all();
 
-            // PASS 3: Download metadata and data
+            float t_ms = 0;
+            cudaEventElapsedTime(&t_ms, ev_start[0], ev_stop[0]); ms_stage[0] += t_ms;
+            cudaEventElapsedTime(&t_ms, ev_start[1], ev_stop[1]); ms_stage[1] += t_ms;
+
             for (int ch = 0; ch < img_ch; ++ch) {
                 const int num_blocks = (pw[ch] / block_size) * (ph[ch] / block_size);
                 uint32_t rle_byte_len = 0;
@@ -321,9 +347,7 @@ void compress_flipbook(const std::string& in_dir, const std::string& out_path, i
                     if (pack_len > 0 && d_pack) {
                         cuda_memcpy_to_host(ef.channels[ch].data.data(), d_pack, pack_len);
                     }
-                    // Since we stay offline, we store a placeholder frequency - the decoder will use d_hist or we can download it.
-                    // Actually we need frequencies on host for the file header.
-                    cuda_compute_histogram(ch, (uint32_t*)ef.channels[ch].huffman_freq, nullptr); // This is just a copy now
+                    cuda_compute_histogram(ch, (uint32_t*)ef.channels[ch].huffman_freq, nullptr);
                 } else {
                     std::memset(ef.channels[ch].huffman_freq, 0, sizeof(ef.channels[ch].huffman_freq));
                     ef.channels[ch].data.clear();
@@ -398,6 +422,19 @@ void compress_flipbook(const std::string& in_dir, const std::string& out_path, i
     double ratio = (double)raw_size / (double)file_size;
 
     std::cout << "\n  Finished compressing flipbook.\n";
+    
+    double dct_gb = (total_pixels * 5.0) / 1e9;
+    double dct_bw = dct_gb / (ms_stage[0] / 1000.0);
+    
+    double rle_gb = (total_pixels * 2.5) / 1e9;
+    double rle_bw = rle_gb / (ms_stage[1] / 1000.0);
+
+    for (int i = 0; i < 3; ++i) {
+        cudaEventDestroy(ev_start[i]);
+        cudaEventDestroy(ev_stop[i]);
+    }
+
+    std::cout << "  [PERFORMANCE] DCT_BW=" << dct_bw << " GB/s, RLE_Huffman_BW=" << rle_bw << " GB/s\n";
     std::cout << "  [BENCHMARK] compress_ms=" << compress_ms
               << " frames=" << frames.size()
               << " compress_fps=" << compress_fps
