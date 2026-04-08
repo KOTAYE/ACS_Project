@@ -1,26 +1,40 @@
-# CUDA streams і pinned memory (компресія flipbook)
+# CUDA Streams and Pinned Memory
 
-## Pinned host memory
+To achieve high throughput (490+ FPS), we use a combination of **Pinned Memory** and **CUDA Streams**. This allows us to hide the delay of moving data between the CPU and GPU.
 
-- **`cudaHostAlloc`** для staging H→D: `g_h_rgb_in` має розмір **2 × g_total_bytes** (два слоти ping-pong). Копіювання з pageable `Frame` у pinned робить CPU (`memcpy`), після чого **`cudaMemcpyAsync(..., g_transfer_stream)`** може йти по DMA без блокування сторінок джерела.
-- **`g_h_rgb_out`** лишається одним буфером для декоду (без змін цього документа).
+## Pinned Memory (H2D Staging)
 
-## Два device-буфери на канал для `d_src`
+Standard CPU memory (pageable) is slow for GPU transfers because the OS can move it around. We use **`cudaHostAlloc`** to reserve "Pinned" (non-pageable) memory.
 
-Щоб H2D кадру **N+1** не перезаписував ще непрочитаний `d_src` кадру **N**, для кожного каналу виділено **`d_src_ping[0]`** та **`d_src_ping[1]`**. Слот вибирається як `frame_index % 2`.
+- **Fast DMA**: The GPU can read pinned memory directly.
+- **Async ready**: Only pinned memory supports truly asynchronous (non-blocking) transfers.
 
-## Події та стріми
+We use a **Ping-Pong Buffer** strategy for the input frames. While the GPU is processing Frame 0, the CPU is already copying Frame 1 into the second pinned buffer.
 
-- **`g_transfer_stream`**: послідовність H2D для обох слотів; перед повторним використанням слоту **`cudaStreamWaitEvent(transfer, encode_slot_done[slot])`** (починаючи з `frame_index >= 2`).
-- **`g_evt_h2d_done[slot]`**: записується після всіх `MemcpyAsync` кадру в цьому слоті; **`cuda_encode_channel`** на кожному `g_stream[ch]` робить **`cudaStreamWaitEvent(stream, h2d_done[slot])`** перед encode.
-- **`g_evt_encode_slot_done[slot]`**: записується після останнього encode-ядра кадру на `g_stream[last_ch]`; звільняє device `d_src[slot]` для наступного H2D у той самий слот.
+## CUDA Streams (Parallel Tasks)
 
-## Накладання з наступним кадром
+By default, CUDA does one thing at a time. We use multiple **Streams** to run tasks in parallel:
 
-У `codec.cpp` після encode **усіх** каналів поточного кадру виконується **`pop`** наступного `Frame` і, якщо він валідний, **`cuda_submit_frame_h2d(f_idx + 1, ...)`** на `g_transfer_stream`. Далі йде RLE/Huffman поточного кадру на `g_stream[ch]`. Таким чином **перенесення наступного кадру на GPU** може виконуватися **паралельно** з ентропійною фазою попереднього.
+1. **`g_transfer_stream`**: Handles copying raw image data from CPU to GPU (H2D).
+2. **`g_stream[0..2]`**: Three separate streams (one per color channel) that run the actual compression kernels.
 
-## API
+### The Overlap Workflow
+Because we use separate streams, the GPU can do two things at the exact same time:
+- **Stream A**: Finish compression for the current frame.
+- **Stream B**: Start downloading the next frame from the CPU.
 
-- `cuda_submit_frame_h2d(frame_index, ptrs, channels)` — без `cudaStreamSynchronize` на transfer stream.
-- `cuda_encode_channel(..., src_slot)` — очікує `g_evt_h2d_done[src_slot]`.
-- `cuda_record_encode_slot_done(slot, last_ch)` — після останнього encode каналу кадру.
+This "hiding" of the transfer time is why the CUDA backend is so much faster than the CPU versions.
+
+## Synchronization with Events
+
+To make sure we don't start processing before the data arrives, we use **CUDA Events**:
+- `g_evt_h2d_done`: Tells the GPU kernels it is safe to start.
+- `g_evt_encode_slot_done`: Tells the CPU it is safe to overwrite the pinned buffer with a new frame.
+
+## Summary Diagram
+```text
+[ CPU ] -> (Copy to Pinned) -> [ DMA ] -> (H2D Transfer Stream) -> [ GPU ]
+                                  |
+                                  +--> [ Compute Streams ] -> (DCT/Huffman)
+```
+The goal is to keep the [ Compute Streams ] busy 100% of the time.

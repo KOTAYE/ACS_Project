@@ -17,7 +17,6 @@
         } \
     } while (0)
 
-// Helper for robust cleanup
 template<typename T>
 void robust_cuda_free(T*& ptr) {
     if (ptr) {
@@ -59,7 +58,6 @@ struct GPU_PinnedMetadata {
     uint32_t num_blocks;
 };
 
-// --- Tree build helpers (Host) ---
 struct HuffTreeBuildNode {
     int left, right, symbol;
     uint32_t count;
@@ -98,7 +96,7 @@ static void ht_to_gpu_nodes(const HuffTreeBuildNode* nodes, int num_nodes, GpuHu
     }
 }
 
-// --- Kernels ---
+
 __global__ void RleCountPerBlockKernel(const int16_t* __restrict__ in, int num_blocks, int block_size_sq, int* counts) {
     extern __shared__ int16_t s_blk[];
     int bid = blockIdx.x;
@@ -106,7 +104,6 @@ __global__ void RleCountPerBlockKernel(const int16_t* __restrict__ in, int num_b
     int tid = threadIdx.x;
     const int16_t* b_ptr = &in[(size_t)bid * block_size_sq];
 
-    // Coalesced parallel load into shared memory
     for (int i = tid; i < block_size_sq; i += blockDim.x) {
         s_blk[i] = b_ptr[i];
     }
@@ -132,7 +129,6 @@ __global__ void RleScatterPerBlockKernel(const int16_t* __restrict__ in, int num
     int tid = threadIdx.x;
     const int16_t* b_ptr = &in[(size_t)bid * block_size_sq];
 
-    // Coalesced parallel load
     for (int i = tid; i < block_size_sq; i += blockDim.x) {
         s_blk[i] = b_ptr[i];
     }
@@ -152,7 +148,7 @@ __global__ void RleScatterPerBlockKernel(const int16_t* __restrict__ in, int num
 }
 
 __global__ void HuffmanBlockBitLengthKernel(const int16_t* __restrict__ rle_in, const int* rle_offsets, const int* rle_counts, int num_blocks, const uint8_t* __restrict__ lens, uint32_t* blen) {
-    extern __shared__ uint8_t s_lens[]; // Cache huffman lens
+    extern __shared__ uint8_t s_lens[];
     int tid = threadIdx.x;
     if (tid < 256) s_lens[tid] = lens[tid];
     __syncthreads();
@@ -160,7 +156,6 @@ __global__ void HuffmanBlockBitLengthKernel(const int16_t* __restrict__ rle_in, 
     int bid = blockIdx.x;
     if (bid >= num_blocks) return;
     
-    // RLE data is already sparse, but we can still parallelize the bit length summing
     const uint8_t* b_ptr = (const uint8_t*)&rle_in[(size_t)rle_offsets[bid]];
     int n = rle_counts[bid] * 2;
     
@@ -169,7 +164,6 @@ __global__ void HuffmanBlockBitLengthKernel(const int16_t* __restrict__ rle_in, 
         total += s_lens[b_ptr[i]];
     }
     
-    // Per-block reduction using shuffle
     for (int mask = 16; mask > 0; mask >>= 1) {
         total += __shfl_xor_sync(0xffffffff, total, mask);
     }
@@ -191,7 +185,6 @@ __device__ void dev_write_bits(uint8_t* out, uint32_t& off, uint32_t code, int n
     for (int i = n - 1; i >= 0; --i) {
         if ((code >> i) & 1u) {
             uint32_t p = off;
-            // Standard bitstream: first bit is MSB of first byte (1 << 7)
             atomicOr((unsigned int*)&out[(p >> 3) & ~3], (1u << ((7 - (p & 7)) + 8 * (p >> 3 & 3))));
         }
         off++;
@@ -199,7 +192,7 @@ __device__ void dev_write_bits(uint8_t* out, uint32_t& off, uint32_t code, int n
 }
 
 __global__ void HuffmanPackKernel(const int16_t* __restrict__ rle_in, const int* rle_off, const int* rle_cnt, int num_blocks, const uint32_t* __restrict__ bits, const uint8_t* __restrict__ lens, const uint32_t* bit_off, uint8_t* out) {
-    extern __shared__ uint32_t s_pack_buf[]; // We'll share space for bits/lens
+    extern __shared__ uint32_t s_pack_buf[];
     uint32_t* s_bits = s_pack_buf;
     uint8_t*  s_lens = (uint8_t*)&s_pack_buf[256];
     
@@ -217,8 +210,6 @@ __global__ void HuffmanPackKernel(const int16_t* __restrict__ rle_in, const int*
     uint32_t goff = bit_off[bid]; 
     int n = rle_cnt[bid] * 2;
     
-    // Only thread 0 packs for now, but it's now reading from SHARED memory
-    // and the codebook is also in SHARED memory.
     if (tid == 0) {
         for (int i = 0; i < n; ++i) {
             uint8_t s = b_ptr[i];
@@ -269,7 +260,7 @@ __global__ void UpdatePackMeta(const uint32_t* off, const uint32_t* len, int nb,
     if (threadIdx.x==0 && blockIdx.x==0) meta->pack_bytes = (off[nb-1]+len[nb-1]+7u)/8u; 
 }
 
-// --- API Implementation ---
+
 static RleContext* g_rle_ctx[3] = {nullptr, nullptr, nullptr};
 
 void rle_gpu_init(int ch, size_t max_elements) {
@@ -277,7 +268,6 @@ void rle_gpu_init(int ch, size_t max_elements) {
     auto& ctx = *g_rle_ctx[ch];
     if (ctx.capacity >= max_elements) return;
 
-    // Buffer cleanup with safety
     robust_cuda_free(ctx.d_final_out); robust_cuda_free(ctx.d_code_bits); robust_cuda_free(ctx.d_code_lens);
     robust_cuda_free(ctx.d_bitstream); robust_cuda_free(ctx.d_hist); robust_cuda_free(ctx.d_block_rle_counts);
     robust_cuda_free(ctx.d_block_rle_offsets); robust_cuda_free(ctx.d_block_bit_lengths); robust_cuda_free(ctx.d_block_bit_offsets);
@@ -288,7 +278,6 @@ void rle_gpu_init(int ch, size_t max_elements) {
     int mb = (int)((max_elements + 63) / 64);
     ctx.h_metadata_count = mb;
 
-    // Allocate with padding (64KB) to protect against heap corruption
     const size_t padding = 65536;
     CUDA_CHECK(cudaMalloc(&ctx.d_final_out, max_elements * 4 + padding));
     CUDA_CHECK(cudaMalloc(&ctx.d_code_bits, 1024));
@@ -325,8 +314,7 @@ void rle_gpu_cleanup() {
 void cuda_rle_encode_indexed(int ch, const int16_t* d_c, int nb, int bs, void* d_m, void* s) {
     cudaStream_t st = (cudaStream_t)s; auto& cx = *g_rle_ctx[ch]; int bs2 = bs*bs;
     
-    // Launch one CTA per image block for coalesced memory access
-    int tpb = (bs2 > 256) ? 256 : bs2; // Limit threads but cover block elements if needed
+    int tpb = (bs2 > 256) ? 256 : bs2;
     RleCountPerBlockKernel<<<nb, tpb, bs2 * sizeof(int16_t), st>>>(d_c, nb, bs2, cx.d_block_rle_counts);
     
     size_t tb = cx.temp_storage_bytes; cub::DeviceScan::ExclusiveSum(cx.d_temp_storage, tb, cx.d_block_rle_counts, cx.d_block_rle_offsets, nb, st);
@@ -355,14 +343,12 @@ void cuda_huffman_pack_gpu_indexed(int ch, int nb, const uint32_t* h_b, const ui
     if (h_b) { CUDA_CHECK(cudaMemcpyAsync(cx.d_code_bits, h_b, 1024, cudaMemcpyHostToDevice, st)); CUDA_CHECK(cudaMemcpyAsync(cx.d_code_lens, h_l, 256, cudaMemcpyHostToDevice, st)); }
     
     int tpb = 256;
-    // Launch one CTA per block for bit length calculation
     HuffmanBlockBitLengthKernel<<<nb, tpb, 256, st>>>(cx.d_final_out, cx.d_block_rle_offsets, cx.d_block_rle_counts, nb, cx.d_code_lens, cx.d_block_bit_lengths);
     
     size_t tb = cx.temp_storage_bytes; cub::DeviceScan::ExclusiveSum(cx.d_temp_storage, tb, cx.d_block_bit_lengths, cx.d_block_bit_offsets, nb, st);
     if (d_m) UpdatePackMeta<<<1,1,0,st>>>(cx.d_block_bit_offsets, cx.d_block_bit_lengths, nb, (GPU_PinnedMetadata*)d_m);
     CUDA_CHECK(cudaMemsetAsync(cx.d_bitstream, 0, cx.bitstream_cap, st));
     
-    // Launch one CTA per block for packing. Shared memory size: 256*4 + 256*1 = 1280 bytes
     HuffmanPackKernel<<<nb, tpb, 1280, st>>>(cx.d_final_out, cx.d_block_rle_offsets, cx.d_block_rle_counts, nb, cx.d_code_bits, cx.d_code_lens, cx.d_block_bit_offsets, cx.d_bitstream);
     
     if (d_o) *d_o = cx.d_bitstream; if (os) *os = cx.bitstream_cap;

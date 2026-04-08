@@ -1,76 +1,40 @@
-# Масштабування DCT-блоків: 8×8, 16×16, 32×32
+# DCT Block Size Scaling (8x8, 16x16, 32x32)
 
-## Імплементація в коді
+Our codec supports three block sizes: **8x8**, **16x16**, and **32x32**. You can select the size using the `-b` flag during compression.
 
-| Компонент | Підтримка |
-|-----------|-----------|
-| **CUDA** | `encode_blocks_kernel<BS>`, `decode_blocks_kernel<BS>` з `dct2d_device<BS>`, `idct2d_device<BS>` (`src/cuda_kernels.cu`), `BS ∈ {8,16,32}`. |
-| **CPU** | `dct2d_separable_n` / `idct2d_separable_n` з параметром `n` (`src/dct.cpp`), zigzag `codec_zigzag_scan_table(n)` (`src/zigzag.h`). |
-| **CLI** | `-b` / `--block-size` у `flipbook_cuda`, `flipbook_omp`, `flipbook_serial`. |
-| **Квант-матриці** | `make_quant_matrix(..., block_size)` масштабує базові таблиці JPEG під `n×n`. |
+## Implementation Details
 
-Окремі «варіації ядер» реалізовані як **шаблони з константою BS**: одна логіка DCT-II / IDCT, компільована для трьох розмірів (без дублювання алгоритму вручну).
+To keep the code clean, we use **C++ Templates**. This means we write the DCT (Discrete Cosine Transform) logic once, and the compiler generates specialized versions for each block size.
 
-## Якість
+- **GPU**: Uses `encode_blocks_kernel<BS>` where `BS` is the block size.
+- **CPU**: Uses a separable DCT implementation that scales based on the input size.
 
-- **Більший блок** — один вектор коефіцієнтів описує більшу область; на **плавних градієнтах** енергія зосереджується в низьких частотах → **менше значущих AC** після квантування → потенційно **краще стиснення** і менше артефактів «сітки» на великих однотонних зонах.
-- **Менший блок** — краще **локалізує** різкі краї та дрібний текстурний шум; при тій самій «якості» `q` **менший блок** зазвичай дає **вищий PSNR** на деталізованих кадрах, але **більше макроблоків** і більше заголовкової/ентропійної інформації на кадр.
+## Quality vs Performance Trade-offs
 
-Порівняння метрик: `run_benchmark.sh`, `scripts/compute_metrics.py`, або `entropy_reference` для оцінки ентропії після RLE.
+Choosing a block size is a balance between compression quality and processing speed.
 
-## Швидкість
+### Larger Blocks (16x16, 32x32)
+- **Better Quality/Ratio**: Larger blocks allow the DCT to capture more structure in smooth areas (like gradients). This usually results in smaller files and fewer "blocking" artifacts.
+- **Memory Pressure**: On the GPU, larger blocks use more **Shared Memory**. A 32x32 block needs 12 KiB of shared memory, while an 8x8 block only needs 768 bytes.
+- **Throughput**: Larger blocks mean there are fewer blocks overall (a 32x32 block covers 16 times more area than 8x8), which can reduce overhead.
 
-- Кількість **макроблоків** ∝ `1 / BS²` — при 32×32 блоків у **16 разів** менше, ніж при 8×8 на тому ж кадрі.
-- Вартість **одного** блоку: DCT/IDCT у поточній реалізації — **O(BS⁴)** операцій з плаваючою комою на блок (подвійні цикли по BS у `dct2d_device`).
-- Відношення грубо: робота на блок × кількість блоків; на великих роздільностях **16×16** часто компроміс між швидкістю і якістю.
+### Smaller Blocks (8x8)
+- **Fine Details**: Better at preserving sharp edges and high-frequency textures.
+- **Higher Speed**: Calculations are simpler and finish faster per block.
+- **Industry Standard**: 8x8 is the classic size used by JPEG.
 
-## Shared memory (CUDA)
+## Resource Usage Table
 
-Для `encode_blocks_kernel` / `decode_blocks_kernel` виділяється динамічний `__shared__`:
+| Block Size | Pixels | Shared Memory (Bytes) | Ideal Use Case |
+|------------|--------|-----------------------|----------------|
+| **8x8**    | 64     | 768                   | General purpose, high detail |
+| **16x16**  | 256    | 3,072                 | High-resolution frames (2K/4K) |
+| **32x32**  | 1,024  | 12,288                | Smooth gradients, maximum ratio |
 
-\[
-\text{shared\_mem} = 3 \times BS^2 \times \texttt{sizeof(float)} = 12 \times BS^2\ \text{байт}
-\]
+## Benchmarking Different Sizes
 
-| BS | BS² | 3×BS² floats | Байт |
-|----|-----|----------------|------|
-| 8  | 64  | 192            | **768** |
-| 16 | 256 | 768            | **3072** |
-| 32 | 1024| 3072           | **12288** |
-
-Це **лише** буфери DCT (три площини BS× у `float`); додаткові обмеження дають регістри та інші ядра на тому ж stream.
-
-## Occupancy і «варпи на SM»
-
-Запуск:
-
-```cpp
-encode_blocks_kernel<BS><<<grid, 1, shared_mem, stream>>>(...)
-```
-
-- **`blockDim = (1,1,1)`** — **один потік на макроблок** DCT. Уся робота DCT/квант/IDCT виконується **послідовно в цьому потоці**.
-- Тому **не** варто очікувати високої **warp occupancy** у класичному сенсі: один активний потік на блок залишає **31 слот варпу невикористаним**. Обмеження пропускної здатності SM у цьому шляху більше пов’язані з:
-  - **кількістю резидентних блоків** на SM (shared memory на блок, регістри);
-  - **кількістю блоків у сітці** та затримками пам’яті.
-
-Для **32×32** **12 KiB shared на блок** — помітно більше, ніж для 8×8 (**768 B**). На GPU з лімітом **48 KiB shared на блок** (типово) усе ще поміщається, але **менше блоків одночасно** на SM порівняно з 8×8; разом з **1 thread/block** це підкреслює, що **вузьке місце** — інтенсивність одного потоку та пам’ять, а не «повні варпи».
-
-Якщо в майбутньому потрібна вища occupancy, логічний напрям — **розпаралелити** DCT усередині блоку (наприклад, `BS` потоків на рядок/стовпець) і переглянути розклад shared/registers.
-
-## Швидкий експеримент з таймінгом
-
+You can automatically compare all three sizes by running our sweep script:
 ```bash
-chmod +x scripts/sweep_block_size.sh
-FRAMES=Frames ./scripts/sweep_block_size.sh
+bash scripts/sweep_block_size.sh
 ```
-
-Скрипт викликає `flipbook_cuda compress` з `-b 8`, `-b 16`, `-b 32` і друкує рядки `[BENCHMARK]` для порівняння FPS/часу на тому ж наборі кадрів.
-
-### Таблиця для звіту (Phase 2 §4)
-
-```bash
-chmod +x scripts/phase2_block_size_table.sh
-FRAMES=Frames Q=50 ./scripts/phase2_block_size_table.sh
-```
-
-Вивід — markdown-таблиця з `compress_ms`, `compress_fps`, `compressed_bytes`, `compression_ratio` для кожного `-b`.
+This will print a performance table showing FPS and compression ratios for each size.

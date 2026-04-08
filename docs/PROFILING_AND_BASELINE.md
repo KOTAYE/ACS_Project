@@ -1,73 +1,57 @@
-# Профілювання (Nsight) та baseline
+# Profiling and Benchmarking Guide
 
-Цей документ закриває цикл **аудиту продуктивності**, **timeline-аналізу**, **очищення CUDA** і **фіксації baseline**.
+To verify that our optimizations actually work, we use professional profiling tools from NVIDIA and a custom "Baseline" system.
 
-## 1. Nsight Systems — timeline і «дірки» GPU
+## NVIDIA Nsight Tools
 
-**Мета:** побачити простої через синхронні `cudaMemcpy`, `cudaStreamSynchronize`, послідовний CPU між етапами.
+### 1. Nsight Systems (Timeline Analysis)
+Use this to see if the GPU is "waiting" for the CPU.
 
+- **Command**:
+  ```bash
+  bash scripts/profile_nsys.sh
+  ```
+- **What to look for**: Look for big gaps in the timeline. Ideally, the `cudaMemcpyAsync` (blue) should happen at the same time as `Compute Kernels` (green). This is called "Latency Hiding".
+
+### 2. Nsight Compute (Kernel Analysis)
+Use this to see why a specific math operation (like DCT) is slow.
+
+- **Command**:
+  ```bash
+  bash scripts/profile_ncu.sh
+  ```
+- **What to look for**: Check **Memory Throughput** and **Compute Throughput**. If memory is 90% and compute is 10%, your kernel is "Memory Bound" (waiting for data). Our DCT kernels are carefully tuned to balance these.
+
+---
+
+## Performance Baselines
+
+A "Baseline" is a snapshot of how slow or fast the project is right now. We save these as JSON files.
+
+### 1. Capture a new baseline
+If you make a change and want to see if it helps:
 ```bash
-chmod +x scripts/profile_nsys.sh
-# за замовчуванням кадри в ./Frames
-FRAMES=flipbooks ./scripts/profile_nsys.sh
+python3 scripts/capture_baseline.py ./Frames -q 50
 ```
+This saves a file in `baseline/runs/` with details like FPS and memory bandwidth.
 
-Вихід: `reports/nsys_flipbook.nsys-rep`.
-
-**Що перевірити в nsys-ui:**
-
-- Довгі **CPU** ділянки між викликами CUDA на одному потоці — кандидати на pipeline / async.
-- Червоні/довгі **CUDA API** блоки `cudaMemcpy` (Host↔Device) без перекриття з compute — замінити на `cudaMemcpyAsync` + правильний stream / подвійна буферизація (у проєкті вже є окремий `g_transfer_stream` для H2D/D2H площин).
-- Послідовність: encode → RLE/Huffman на тому ж `g_stream[ch]` — очікувані sync після етапів, що читають hist з GPU.
-
-## 2. Nsight Compute — ядра, регістри, occupancy
-
+### 2. Compare with a previous run
 ```bash
-chmod +x scripts/profile_ncu.sh
-FRAMES=Frames ./scripts/profile_ncu.sh
+python3 scripts/compare_baselines.py baseline/runs/old_run.json baseline/runs/new_run.json
 ```
+This script will tell you the percentage of speedup or slowdown.
 
-Вихід: `reports/ncu_flipbook.ncu-rep`. Експортуйте таблицю в **CSV** з Nsight Compute, потім:
+---
 
-```bash
-python3 analyze_ncu.py ваш_експорт.csv
-```
+## Troubleshooting Common Issues
 
-**Що змінено в коді під occupancy:** DCT/IDCT кернели використовують **одну** пару `dct2d_device` / `idct2d_device`; тимчасові буфери макроблоку (**3× BS²** `float`) перенесені в **`__shared__`**, щоб зменшити тиск на регістри для BS=16/32.
+- **"NSYS not found"**: Make sure the NVIDIA Nsight Systems directory is in your `PATH`.
+- **"Permission Denied"**: You might need to run profiling as `sudo` on Linux to access hardware performance counters.
+- **Low Occupancy**: If Nsight Compute says occupancy is low, try changing the block size with `-b 8` or `-b 16` to see how it affects register usage.
 
-## 3. Baseline FPS / час кадру
-
-Автоматичний знімок (парсить `[BENCHMARK]` з `codec.cpp`):
-
-```bash
-python3 scripts/capture_baseline.py Frames -q 50 -b 8
-# або: python3 scripts/capture_baseline.py /abs/path/to/frames -b 16
-```
-
-Результат: `baseline/runs/baseline_<timestamp>_<git>.json`.
-
-Рекомендація: закомітити один **еталонний** JSON після релізу (або скопіювати як `baseline/REFERENCE.json`) і порівнювати нові знімки з ним.
-
-```bash
-python3 scripts/compare_baselines.py baseline/runs/baseline_OLD.json baseline/runs/baseline_NEW.json
-```
-
-## 4. Швидкий регресійний прогін
-
-```bash
-./run_benchmark.sh Frames
-```
-
-Логи з `[BENCHMARK]` лишаються в `benchmark_results/*.log` (див. `.gitignore`).
-
-## 5. Чеклист «ідеального» аудиту
-
-| Крок | Артефакт |
-|------|----------|
-| Systems timeline | `reports/*.nsys-rep` + нотатки про memcpy/sync |
-| Compute kernels | `reports/ncu_*.csv` + `analyze_ncu.py` |
-| Baseline до змін | `baseline/runs/*.json` |
-| Baseline після змін | новий JSON, порівняння полів fps / ms |
-| Регресія | `run_benchmark.sh` або `capture_baseline.py` |
-
-Якщо `nsys` / `ncu` не встановлені, встановіть **NVIDIA Nsight Systems** та **Nsight Compute** з пакету CUDA / окремих інсталяторів NVIDIA.
+## Workflow Summary
+- **Step 1**: Run `capture_baseline.py` before you change any code.
+- **Step 2**: Apply your optimizations.
+- **Step 3**: Run `capture_baseline.py` again.
+- **Step 4**: Use `compare_baselines.py` to see the results.
+- **Step 5**: If results are weird, use **Nsight** to investigate the hardware behavior.
