@@ -26,11 +26,40 @@ __device__ __forceinline__ float ld_u8_as_float(const uint8_t* p) {
     return static_cast<float>(__ldg(p));
 }
 
+__constant__ float c_cos8[8 * 8];
+__constant__ float c_cos16[16 * 16];
+__constant__ float c_cos32[32 * 32];
+
+void cuda_init_dct_constants() {
+    float h_cos8[64], h_cos16[256], h_cos32[1024];
+    auto precompute = [](float* table, int bs) {
+        for (int k = 0; k < bs; ++k) {
+            for (int n = 0; n < bs; ++n) {
+                table[k * bs + n] = std::cos(M_PI * (2.0 * n + 1.0) * k / (2.0 * bs));
+            }
+        }
+    };
+    precompute(h_cos8, 8);
+    precompute(h_cos16, 16);
+    precompute(h_cos32, 32);
+    CUDA_CHECK(cudaMemcpyToSymbol(c_cos8, h_cos8, sizeof(h_cos8)));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_cos16, h_cos16, sizeof(h_cos16)));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_cos32, h_cos32, sizeof(h_cos32)));
+}
 
 
 
 
 
+
+
+template<int BS>
+__device__ __forceinline__ float get_cos(int k, int n) {
+    if constexpr (BS == 8) return c_cos8[k * 8 + n];
+    else if constexpr (BS == 16) return c_cos16[k * 16 + n];
+    else if constexpr (BS == 32) return c_cos32[k * 32 + n];
+    return 0.0f;
+}
 
 template<int BS>
 __device__ void dct2d_device(const float* __restrict__ in, float* __restrict__ out, float* __restrict__ shared) {
@@ -41,7 +70,7 @@ __device__ void dct2d_device(const float* __restrict__ in, float* __restrict__ o
         for (int k = 0; k < BS; ++k) {
             float s = 0.f;
             for (int n = 0; n < BS; ++n)
-                s += row_in[n] * cosf(M_PI_F * (2.0f * n + 1.0f) * k / (2.0f * BS));
+                s += row_in[n] * get_cos<BS>(k, n);
             float ck = (k == 0) ? 0.70710678118f : 1.0f;
             row_tmp[k] = 0.5f * ck * s;
         }
@@ -50,7 +79,7 @@ __device__ void dct2d_device(const float* __restrict__ in, float* __restrict__ o
         for (int k = 0; k < BS; ++k) {
             float s = 0.f;
             for (int n = 0; n < BS; ++n)
-                s += tmp[n * BS + c] * cosf(M_PI_F * (2.0f * n + 1.0f) * k / (2.0f * BS));
+                s += tmp[n * BS + c] * get_cos<BS>(k, n);
             float ck = (k == 0) ? 0.70710678118f : 1.0f;
             out[k * BS + c] = 0.5f * ck * s;
         }
@@ -65,7 +94,7 @@ __device__ void idct2d_device(const float* __restrict__ in, float* __restrict__ 
             float s = 0.f;
             for (int k = 0; k < BS; ++k) {
                 float ck = (k == 0) ? 0.70710678118f : 1.0f;
-                s += ck * in[k * BS + c] * cosf(M_PI_F * (2.0f * n + 1.0f) * k / (2.0f * BS));
+                s += ck * in[k * BS + c] * get_cos<BS>(k, n);
             }
             tmp[n * BS + c] = 0.5f * s;
         }
@@ -77,7 +106,7 @@ __device__ void idct2d_device(const float* __restrict__ in, float* __restrict__ 
             float s = 0.f;
             for (int k = 0; k < BS; ++k) {
                 float ck = (k == 0) ? 0.70710678118f : 1.0f;
-                s += ck * row_in[k] * cosf(M_PI_F * (2.0f * n + 1.0f) * k / (2.0f * BS));
+                s += ck * row_in[k] * get_cos<BS>(k, n);
             }
             row_out[n] = 0.5f * s;
         }
@@ -123,7 +152,7 @@ __global__ void encode_blocks_kernel(
         const int k = tid % BS;
         float s = 0.f;
         for (int n = 0; n < BS; ++n)
-            s += s_blk[rr * BS + n] * cosf(M_PI_F * (2.0f * n + 1.0f) * k / (2.0f * BS));
+            s += s_blk[rr * BS + n] * get_cos<BS>(k, n);
         const float ck = (k == 0) ? 0.70710678118f : 1.0f;
         s_tmp[rr * BS + k] = 0.5f * ck * s;
     }
@@ -134,7 +163,7 @@ __global__ void encode_blocks_kernel(
         const int k = tid / BS;
         float s = 0.f;
         for (int n = 0; n < BS; ++n)
-            s += s_tmp[n * BS + cc] * cosf(M_PI_F * (2.0f * n + 1.0f) * k / (2.0f * BS));
+            s += s_tmp[n * BS + cc] * get_cos<BS>(k, n);
         const float ck = (k == 0) ? 0.70710678118f : 1.0f;
         s_mid[k * BS + cc] = 0.5f * ck * s;
     }
@@ -154,7 +183,7 @@ __global__ void encode_blocks_kernel(
         float s = 0.f;
         for (int k = 0; k < BS; ++k) {
             const float ck = (k == 0) ? 0.70710678118f : 1.0f;
-            s += ck * s_mid[k * BS + cc] * cosf(M_PI_F * (2.0f * n + 1.0f) * k / (2.0f * BS));
+            s += ck * s_mid[k * BS + cc] * get_cos<BS>(k, n);
         }
         s_tmp[n * BS + cc] = 0.5f * s;
     }
@@ -166,7 +195,7 @@ __global__ void encode_blocks_kernel(
         float s = 0.f;
         for (int k = 0; k < BS; ++k) {
             const float ck = (k == 0) ? 0.70710678118f : 1.0f;
-            s += ck * s_tmp[rr * BS + k] * cosf(M_PI_F * (2.0f * n + 1.0f) * k / (2.0f * BS));
+            s += ck * s_tmp[rr * BS + k] * get_cos<BS>(k, n);
         }
         s_blk[rr * BS + n] = 0.5f * s;
     }
@@ -287,6 +316,7 @@ static inline int pad_bs(int n, int bs) { return ((n + bs - 1) / bs) * bs; }
 
 
 void cuda_init() {
+    cuda_init_dct_constants();
     CUDA_CHECK(cudaSetDevice(0));
     for (int i = 0; i < MAX_CH; ++i)
         CUDA_CHECK(cudaStreamCreate(&g_stream[i]));

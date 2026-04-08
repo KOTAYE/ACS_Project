@@ -4,6 +4,7 @@
 
 void cuda_init();
 void cuda_cleanup();
+void cuda_init_dct_constants();
 void cuda_alloc_frame_buffers(int width, int height, int channels,
                               const float* luma_qm, const float* chroma_qm,
                               const int* zigzag, bool use_ycbcr, int block_size = 8);
