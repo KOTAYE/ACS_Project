@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-                      
-                      
+
 """
 Usage:
-    python benchmark.py --runs 5 --input-dir Frames --quality 50
+    python3 benchmark.py --runs 3 --input-dir Frames --quality 80
 """
 
 import argparse
@@ -11,8 +10,6 @@ import subprocess
 import time
 import os
 import sys
-import shutil
-
 
 def parse_args():
     p = argparse.ArgumentParser(description="Flipbook encoding benchmark")
@@ -22,50 +19,16 @@ def parse_args():
                    help="Warm-up runs before timing (default: 1)")
     p.add_argument("--input-dir", default="Frames",
                    help="Input frames directory (default: Frames)")
-    p.add_argument("--quality", type=int, default=50,
-                   help="Compression quality 1-100 (default: 50)")
-    p.add_argument("--skip-build", action="store_true",
-                   help="Skip CMake configure + build step")
+    p.add_argument("--quality", type=int, default=80,
+                   help="Compression quality 1-100 (default: 80)")
     return p.parse_args()
 
-
-def build_all(project_root):
-    bench_src = os.path.join(project_root, "bench")
-    build_dir = os.path.join(project_root, "build_bench")
-
-    if not os.path.exists(build_dir):
-        print("[BUILD] Configuring CMake...")
-        r = subprocess.run(
-            ["cmake", "-S", bench_src, "-B", build_dir,
-             "-G", "Visual Studio 17 2022"],
-            capture_output=True, text=True
-        )
-        if r.returncode != 0:
-            print(f"CMake configure failed:\n{r.stderr}")
-            sys.exit(1)
-
-    print("[BUILD] Building all targets (Release)...")
-    r = subprocess.run(
-        ["cmake", "--build", build_dir, "--config", "Release"],
-        capture_output=True, text=True
-    )
-    if r.returncode != 0:
-        print(f"Build failed:\n{r.stderr}\n{r.stdout}")
-        sys.exit(1)
-
-    print("[BUILD] Done.\n")
-    return build_dir
-
-
-def robust_remove(path, retries=5, delay=0.2):
-    for i in range(retries):
+def robust_remove(path):
+    if os.path.exists(path):
         try:
-            if os.path.exists(path):
-                os.remove(path)
-            return
-        except PermissionError:
-            time.sleep(delay)
-    print(f"Warning: Could not remove {path}")
+            os.remove(path)
+        except:
+            pass
 
 def run_once(exe, input_dir, quality, output_bin):
     """Run one compression, return elapsed seconds or None on failure."""
@@ -82,12 +45,10 @@ def run_once(exe, input_dir, quality, output_bin):
         return None
     return elapsed
 
-
 def benchmark_backend(name, exe, input_dir, quality, warmup, runs):
-    """Warm up, then run `runs` timed iterations. Return list of times."""
+    """Warm up, then run iterations. Return list of times."""
     output_bin = f"_bench_{name.lower()}.bin"
-
-             
+    
     for w in range(warmup):
         t = run_once(exe, input_dir, quality, output_bin)
         if t is None:
@@ -95,7 +56,6 @@ def benchmark_backend(name, exe, input_dir, quality, warmup, runs):
             return []
         print(f"  Warm-up {w+1}/{warmup}: {t:.2f}s")
 
-                
     times = []
     for i in range(runs):
         t = run_once(exe, input_dir, quality, output_bin)
@@ -105,11 +65,8 @@ def benchmark_backend(name, exe, input_dir, quality, warmup, runs):
         times.append(t)
         print(f"  Run {i+1}/{runs}: {t:.2f}s")
 
-                            
     robust_remove(output_bin)
-
     return times
-
 
 def print_table(results):
     serial_avg = results.get("Serial", {}).get("avg")
@@ -124,83 +81,26 @@ def print_table(results):
         print(f"  {name:<10} {d['avg']:<12.3f} {d['min']:<12.3f} {sp:<10}")
     print("=" * 52)
 
-
-def plot_chart(results, runs, quality):
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print("\n[CHART] matplotlib not installed — skipping chart.")
-        print("        Install with: pip install matplotlib")
-        return
-
-    order = [n for n in ["Serial", "OpenMP", "CUDA"] if n in results]
-    avgs = [results[n]["avg"] for n in order]
-    mins = [results[n]["min"] for n in order]
-    colors = {"CUDA": "#76b900", "OpenMP": "#0071c5", "Serial": "#888888"}
-
-    fig, ax = plt.subplots(figsize=(8, 5))
-    bars = ax.bar(order, avgs,
-                  color=[colors[n] for n in order],
-                  edgecolor="white", linewidth=1.5, zorder=3)
-
-                            
-    for bar, avg, mn in zip(bars, avgs, mins):
-        x = bar.get_x() + bar.get_width() / 2
-        ax.text(x, avg + max(avgs) * 0.02,
-                f"{avg:.2f}s", ha="center", va="bottom",
-                fontweight="bold", fontsize=13)
-
-    serial_avg = results.get("Serial", {}).get("avg")
-    if serial_avg:
-        for bar, avg in zip(bars, avgs):
-            x = bar.get_x() + bar.get_width() / 2
-            sp = serial_avg / avg
-            if sp != 1.0:
-                ax.text(x, avg / 2, f"{sp:.1f}x",
-                        ha="center", va="center",
-                        fontsize=14, fontweight="bold", color="white")
-
-    ax.set_ylabel("Average Time (seconds)", fontsize=12)
-    ax.set_title(f"Encoding Benchmark  ({runs} runs, quality={quality})",
-                 fontsize=14, fontweight="bold")
-    ax.set_ylim(0, max(avgs) * 1.25)
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    ax.grid(axis="y", alpha=0.3, zorder=0)
-
-    chart_path = "benchmark_results.png"
-    plt.tight_layout()
-    plt.savefig(chart_path, dpi=150)
-    print(f"\n[CHART] Saved to: {chart_path}")
-
-                 
-    if sys.platform == "win32":
-        os.startfile(chart_path)
-
-
 def main():
     args = parse_args()
     project_root = os.path.dirname(os.path.abspath(__file__))
+    build_dir = os.path.join(project_root, "build")
 
-    if not args.skip_build:
-        build_dir = build_all(project_root)
-    else:
-        build_dir = os.path.join(project_root, "build_bench")
+    if not os.path.exists(build_dir):
+        print(f"Error: Build directory not found at {build_dir}. Please run 'make' first.")
+        sys.exit(1)
 
-    exe_dir = os.path.join(build_dir, "Release")
     backends = {
-        "CUDA":   os.path.join(exe_dir, "bench_cuda.exe"),
-        "OpenMP": os.path.join(exe_dir, "bench_omp.exe"),
-        "Serial": os.path.join(exe_dir, "bench_serial.exe"),
+        "CUDA":   os.path.join(build_dir, "flipbook_cuda"),
+        "OpenMP": os.path.join(build_dir, "flipbook_omp"),
+        "Serial": os.path.join(build_dir, "flipbook_serial"),
     }
 
     results = {}
 
     for name, exe in backends.items():
         if not os.path.exists(exe):
-            print(f"[{name}] executable not found ({exe}), skipping.\n")
+            print(f"[{name}] binary not found at {exe}, skipping.\n")
             continue
 
         print(f"[{name}] {args.warmup} warm-up + {args.runs} timed runs:")
@@ -214,22 +114,13 @@ def main():
             }
             print(f"  → Average: {results[name]['avg']:.3f}s\n")
         else:
-            print(f"  → All runs failed.\n")
+            print(f"  → FAILED.\n")
 
     if not results:
         print("No results collected.")
         return
 
     print_table(results)
-    plot_chart(results, args.runs, args.quality)
-
-                   
-    for f in os.listdir(project_root):
-        if f.startswith("_bench_") and f.endswith(".bin"):
-            robust_remove(os.path.join(project_root, f))
-
-    print("\nDone. Temporary files cleaned up.")
-
 
 if __name__ == "__main__":
     main()
