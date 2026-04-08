@@ -147,3 +147,27 @@ Thumbs.db
 
 Frames/
 frames_restored/
+benchmark_results/
+frames_cuda/
+frames_recon_*/
+*.qdstrm
+*.nsys-rep
+
+# Profiling / baseline runs (keep baseline/README.md tracked)
+reports/
+baseline/runs/
+output*.bin
+_*test*
+_quick_*
+_t2.bin
+
+# CI/demo artifacts and generated previews
+_ci_*.bin
+_ci_recon_*/
+
+# Large local asset/document files (keep out of pushes unless intentional)
+flipbooks/flipbook_textures1_FC.png
+*.pdf
+
+.idea/
+third_party/
