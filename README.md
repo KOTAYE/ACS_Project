@@ -1,154 +1,103 @@
-Authors (team):<br>
-Denys Maletskiy (https://github.com/maletsden),<br>
-Viktor Syrotiuk (https://github.com/KOTAYE),<br>
-Yulian Zaiats (https://github.com/Scorpion1355),<br>
-Artem Onyshchuk (https://github.com/Sneezyan123),<br>
-Yarema Mykhasiak (https://github.com/YarkoMarko)<br>
+# Flipbook Compression Pipeline
 
-**Стискання та відновлення послідовностей зображень (flipbook) із трьома бекендами обробки.**  
-Кодек реалізує JPEG-подібний пайплайн: перетворення кольору YCbCr → DCT → квантування → кодування Гаффмана.
+High-performance flipbook sequence compression for GPU and CPU. This project implements a JPEG-like pipeline (YCbCr → DCT → Quantization → Huffman) optimized for NVIDIA GPUs (CUDA) and multi-core CPUs (OpenMP).
 
-**Автори:**  
-Denys Maletskiy ([@maletsden](https://github.com/maletsden)),  
-Viktor Syrotiuk ([@KOTAYE](https://github.com/KOTAYE)),  
-Yulian Zaiats ([@Scorpion1355](https://github.com/Scorpion1355)),  
-Artem Onyshchuk ([@Sneezyan123](https://github.com/Sneezyan123)),  
-Yarema Mykhasiak ([@YarkoMarko](https://github.com/YarkoMarko))
+## Authors (Team)
+- **Denys Maletskiy** ([@maletsden](https://github.com/maletsden))
+- **Viktor Syrotiuk** ([@KOTAYE](https://github.com/KOTAYE))
+- **Yulian Zaiats** ([@Scorpion1355](https://github.com/Scorpion1355))
+- **Artem Onyshchuk** ([@Sneezyan123](https://github.com/Sneezyan123))
+- **Yarema Mykhasiak** ([@YarkoMarko](https://github.com/YarkoMarko))
 
 ---
 
-## Вимоги
+## Prerequisites
 
-| Інструмент | Версія |
-|---|---|
-| CMake | ≥ 3.20 |
-| MSVC / GCC | з підтримкою C++20 |
-| CUDA Toolkit | ≥ 11.0 (для `flipbook_cuda`) |
-| OpenMP | будь-яка сучасна версія (для `flipbook_omp`) |
-| Python | ≥ 3.8 (для скриптів) |
-| matplotlib | для побудови графіків (`pip install matplotlib`) |
-| opencv-python | для `merge_frames.py` (`pip install opencv-python`) |
+Before you start, make sure you have these tools installed:
+
+- **CMake** (v3.20 or newer)
+- **C++ Compiler** (GCC, MSVC, or Clang with C++20 support)
+- **CUDA Toolkit** (v11.0 or newer) - *Required for GPU acceleration*
+- **OpenMP** - *Required for CPU parallelization*
+- **zlib** - *Required for .exr file support*
+
+### Python setup (for benchmarks and charts)
+```bash
+pip install matplotlib pillow numpy opencv-python
+```
 
 ---
 
-## Збірка
+## Getting Started
+
+### 1. Build the Project
+Use CMake to configure and build the executables:
 
 ```bash
-cmake -S . -B build -G "Visual Studio 17 2022"
+# Configure the build
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 
-cmake --build build --config Release
+# Build all targets
+cmake --build build --config Release -j
 ```
 
-Після збірки в папці `build/Release/` з'являться три виконуваних файли:
-
-| Файл | Бекенд |
-|---|---|
-| `flipbook_cuda.exe` | GPU (CUDA) |
-| `flipbook_omp.exe` | CPU багатопотоковий (OpenMP) |
-| `flipbook_serial.exe` | CPU однопотоковий |
+After building, you will find 3 main programs in `build/` (or `build/Release/`):
+- `flipbook_cuda`: Uses NVIDIA GPU for maximum speed.
+- `flipbook_omp`: Uses multi-core CPU via OpenMP.
+- `flipbook_serial`: Standard single-threaded CPU version.
 
 ---
 
-## Використання
+## How to Use
 
-Всі три виконуваних файли мають однаковий інтерфейс командного рядка.
-
-### Стиснення
-
+### Compression
+To compress a folder of images (PNG, JPG, or EXR):
 ```bash
-flipbook_cuda.exe compress [-q <якість>] [--no-ycbcr] <вхідна_папка> <вихідний.bin>
+./flipbook_cuda compress -q 75 -b 16 ./input_frames/ output.bin
 ```
+**Flags:**
+- `-q <1-100>`: Set quality (higher is better). Default is 50.
+- `-b <8|16|32>`: Set DCT block size. Larger blocks can improve compression. Default is 8.
+- `--no-ycbcr`: Skip color conversion (compress RGB directly).
 
-| Параметр | Опис |
-|---|---|
-| `-q <1–100>` | Якість стиснення (за замовчуванням: **50**). Більше = краща якість |
-| `--no-ycbcr` | Вимкнути перетворення кольору YCbCr (обробляти RGB напряму) |
-| `<вхідна_папка>` | Папка з PNG/JPG кадрами (наприклад, `Frames/`) |
-| `<вихідний.bin>` | Шлях до вихідного бінарного файлу |
-
-**Приклад:**
+### Decompression
+To restore images from a binary file:
 ```bash
-# CUDA, якість 75
-flipbook_cuda.exe compress -q 75 Frames/ output.bin
-
-# OpenMP, якість за замовчуванням
-flipbook_omp.exe compress Frames/ output.bin
-
-# Serial, без перетворення кольору
-flipbook_serial.exe compress --no-ycbcr Frames/ output.bin
+./flipbook_cuda decompress output.bin ./restored_frames/
 ```
-
-### Декомпресія
-
-```bash
-flipbook_cuda.exe decompress <вхідний.bin> <вихідна_папка>
-```
-
-**Приклад:**
-```bash
-flipbook_cuda.exe decompress output.bin frames_restored/
-```
-
-Відновлені кадри збережуться у вказаній папці у форматі PNG.
 
 ---
 
-## Складання відео з кадрів
+## Analytics and Scripts
 
-Після декомпресії можна зібрати відео з відновлених кадрів:
+We provide several scripts to test performance and quality:
 
-```bash
-python merge_frames.py <папка_з_кадрами> [fps]
-```
-
-**Приклад:**
-```bash
-python merge_frames.py frames_restored/ 24
-```
-
-Результат: файл `output.mp4` у поточній директорії.
-
----
-
-## Бенчмарк
-
-Скрипт `benchmark.py` автоматично збирає окремі бенчмарк-таргети, запускає всі три бекенди та порівнює час стиснення.
-
-```bash
-python benchmark.py [--runs <N>] [--warmup <N>] [--input-dir <папка>] [--quality <1-100>] [--skip-build]
-```
-
-| Параметр | Опис | За замовчуванням |
-|---|---|---|
-| `--runs` | Кількість вимірювальних запусків | 3 |
-| `--warmup` | Кількість прогрівальних запусків | 1 |
-| `--input-dir` | Папка з вхідними кадрами | `Frames` |
-| `--quality` | Якість стиснення | 50 |
-| `--skip-build` | Пропустити крок збірки | — |
-
-**Приклад:**
-```bash
-python benchmark.py --runs 5 --input-dir Frames --quality 75
-```
-
-Після завершення виводиться таблиця результатів і зберігається графік `benchmark_results.png`.
+- **Full Benchmark**: Run all backends and generate charts.
+  ```bash
+  bash scripts/run_tests_and_charts.sh
+  ```
+- **Quick Test**: Verify end-to-end functionality of the CUDA backend.
+  ```bash
+  bash scripts/quick_test.sh
+  ```
+- **Nsight Profiling**: Generate GPU performance reports.
+  ```bash
+  bash scripts/profile_gpu.sh
+  ```
 
 ---
 
-## Аналіз профілювання CUDA (Nsight Compute)
+## Technical Documentation
 
-Для аналізу `.csv`-звітів з **NVIDIA Nsight Compute**:
+For deep technical details, check the internal documentation:
 
-```bash
-python analyze_ncu.py <шлях_до_файлу.csv>
-```
+- **[Block Size Scaling](docs/BLOCK_SIZE_SCALING.md)**: How block sizes (8, 16, 32) affect speed and quality.
+- **[CUDA Streams & Memory](docs/CUDA_STREAMS_PINNED.md)**: Details on Pinned Memory and asynchronous data transfers.
+- **[GPU Huffman Bitstream](docs/GPU_HUFFMAN_BITSTREAM.md)**: Our parallel bit-packing format for GPU entropy coding.
+- **[Pipeline Threading](docs/PIPELINE_THREADING.md)**: Information on the producer-consumer model for I/O and parsing.
+- **[Profiling & Benchmarking](docs/PROFILING_AND_BASELINE.md)**: Guide on using Nsight Systems and capturing performance baselines.
 
-**Приклад:**
-```bash
-python analyze_ncu.py stat1.csv
-```
+---
 
-Виводить таблицю по кожному CUDA-ядру: кількість викликів, середній час виконання, завантаженість обчислень та пам'яті, кількість регістрів.
-
-
-```
+## File Formats
+The project uses a custom `.bin` format (`FLI3`) which is compatible across all backends. You can compress on a GPU and decompress with OpenMP seamlessly.

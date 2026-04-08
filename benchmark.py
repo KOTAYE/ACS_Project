@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+                      
+                      
 """
 Usage:
     python benchmark.py --runs 5 --input-dir Frames --quality 50
@@ -85,7 +87,7 @@ def benchmark_backend(name, exe, input_dir, quality, warmup, runs):
     """Warm up, then run `runs` timed iterations. Return list of times."""
     output_bin = f"_bench_{name.lower()}.bin"
 
-    # Warm-up
+             
     for w in range(warmup):
         t = run_once(exe, input_dir, quality, output_bin)
         if t is None:
@@ -93,7 +95,7 @@ def benchmark_backend(name, exe, input_dir, quality, warmup, runs):
             return []
         print(f"  Warm-up {w+1}/{warmup}: {t:.2f}s")
 
-    # Timed runs
+                
     times = []
     for i in range(runs):
         t = run_once(exe, input_dir, quality, output_bin)
@@ -103,7 +105,7 @@ def benchmark_backend(name, exe, input_dir, quality, warmup, runs):
         times.append(t)
         print(f"  Run {i+1}/{runs}: {t:.2f}s")
 
-    # Clean up output binary
+                            
     robust_remove(output_bin)
 
     return times
@@ -143,7 +145,7 @@ def plot_chart(results, runs, quality):
                   color=[colors[n] for n in order],
                   edgecolor="white", linewidth=1.5, zorder=3)
 
-    # Error bars showing min
+                            
     for bar, avg, mn in zip(bars, avgs, mins):
         x = bar.get_x() + bar.get_width() / 2
         ax.text(x, avg + max(avgs) * 0.02,
@@ -173,7 +175,7 @@ def plot_chart(results, runs, quality):
     plt.savefig(chart_path, dpi=150)
     print(f"\n[CHART] Saved to: {chart_path}")
 
-    # Try to open
+                 
     if sys.platform == "win32":
         os.startfile(chart_path)
 
@@ -221,7 +223,7 @@ def main():
     print_table(results)
     plot_chart(results, args.runs, args.quality)
 
-    # Final cleanup
+                   
     for f in os.listdir(project_root):
         if f.startswith("_bench_") and f.endswith(".bin"):
             robust_remove(os.path.join(project_root, f))
