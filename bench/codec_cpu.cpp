@@ -275,8 +275,8 @@ void compress_flipbook(const std::string& in_dir, const std::string& out_path, i
             const uint8_t* raw_bytes = reinterpret_cast<const uint8_t*>(rle_buffer.data());
             const int raw_len = static_cast<int>(rle_buffer.size() * sizeof(int16_t));
 
-            if (encoded.size() < static_cast<size_t>(raw_len) + 4096u)
-                encoded.resize(static_cast<size_t>(raw_len) + 4096u);
+            if (encoded.size() < static_cast<size_t>(raw_len) + 16384u)
+                encoded.resize(static_cast<size_t>(raw_len) + 16384u);
 
             int enc_total = 0;
             if (raw_len > 0) {
@@ -297,15 +297,15 @@ void compress_flipbook(const std::string& in_dir, const std::string& out_path, i
             out.write(reinterpret_cast<const char*>(&payload), sizeof(payload));
             out.write(reinterpret_cast<const char*>(&nb), sizeof(nb));
 
-            std::array<uint16_t, 256> freq{};
-            if (enc_total >= 512)
-                std::memcpy(freq.data(), encoded.data(), 512);
-            out.write(reinterpret_cast<const char*>(freq.data()), 512);
+            std::array<uint32_t, 256> freq{};
+            if (enc_total >= sizeof(uint32_t) * 256)
+                std::memcpy(freq.data(), encoded.data(), sizeof(uint32_t) * 256);
+            out.write(reinterpret_cast<const char*>(freq.data()), sizeof(freq));
 
             std::vector<uint32_t> bl(static_cast<size_t>(nb), 0u);
             out.write(reinterpret_cast<const char*>(bl.data()), nb * sizeof(uint32_t));
             if (payload > 0)
-                out.write(reinterpret_cast<const char*>(encoded.data() + 512), payload);
+                out.write(reinterpret_cast<const char*>(encoded.data() + sizeof(uint32_t) * 256), payload);
         }
 
         std::swap(curr_recon.data, prev_recon.data);
@@ -404,8 +404,8 @@ void decompress_flipbook(const std::string& in_path, const std::string& out_dir)
             in.read(reinterpret_cast<char*>(&len32), sizeof(len32));
             in.read(reinterpret_cast<char*>(&num_blocks_file), sizeof(num_blocks_file));
 
-            std::vector<uint16_t> h_freq(256);
-            in.read(reinterpret_cast<char*>(h_freq.data()), 512);
+            std::vector<uint32_t> h_freq(256);
+            in.read(reinterpret_cast<char*>(h_freq.data()), h_freq.size() * sizeof(uint32_t));
 
             if (!in || num_blocks_file > 10000000u) {
                 std::cerr << "\nCorrupt channel header (frame " << f_idx << " ch " << ch << ")\n";
@@ -459,9 +459,9 @@ void decompress_flipbook(const std::string& in_path, const std::string& out_dir)
                     }
                 }
             } else if (len32 > 0 && rle_bytes_len > 0) {
-                std::vector<uint8_t> enc_with_hdr(512 + len32);
-                std::memcpy(enc_with_hdr.data(), h_freq.data(), 512);
-                std::memcpy(enc_with_hdr.data() + 512, encoded.data(), len32);
+                std::vector<uint8_t> enc_with_hdr(sizeof(uint32_t) * 256 + len32);
+                std::memcpy(enc_with_hdr.data(), h_freq.data(), sizeof(uint32_t) * 256);
+                std::memcpy(enc_with_hdr.data() + sizeof(uint32_t) * 256, encoded.data(), len32);
 
                 std::vector<int16_t> rle_buf(rle_bytes_len / sizeof(int16_t));
                 if (huffman_decode_bytes(enc_with_hdr.data(), static_cast<int>(enc_with_hdr.size()),

@@ -4,7 +4,7 @@
 
 QuantMatrix make_quant_matrix(const QuantMatrix8& base, int quality, int block_size) {
     int q = std::clamp(quality, 1, 100);
-    const float scale = (q < 50) ? 50.0f / (float)q : 2.0f - (float)q / 50.0f;
+    const float scale = (q < 50) ? (5000.0f / (float)q) / 100.0f : (200.0f - 2.0f * (float)q) / 100.0f;
 
     QuantMatrix qm(block_size * block_size);
     if (block_size == 8) {
