@@ -20,7 +20,7 @@ static std::array<uint32_t, kNumSymbols> code_bits;
 static std::array<Node, kMaxNodes> nodes;
 static int num_nodes;
 
-static int build_tree(const uint16_t* freq) {
+static int build_tree(const uint32_t* freq) {
     num_nodes = 0;
     std::array<int, kNumSymbols> roots;
     int num_roots = 0;
@@ -128,11 +128,11 @@ static int read_bit_abs(const uint8_t* packed, int packed_len_bytes, int abs_bit
 }
 
 int huffman_encode_block_64(const float* block, uint8_t* encoded, int encoded_max_size) {
-    constexpr int header_size = kNumSymbols * static_cast<int>(sizeof(uint16_t));
+    constexpr int header_size = kNumSymbols * static_cast<int>(sizeof(uint32_t));
     if (encoded_max_size < header_size) return -1;
 
-    auto* freq = reinterpret_cast<uint16_t*>(encoded);
-    std::fill(freq, freq + kNumSymbols, uint16_t{0});
+    auto* freq = reinterpret_cast<uint32_t*>(encoded);
+    std::fill(freq, freq + kNumSymbols, uint32_t{0});
 
     const auto* bytes = reinterpret_cast<const uint8_t*>(block);
     for (int i = 0; i < kBlockBytes; ++i) ++freq[bytes[i]];
@@ -160,10 +160,10 @@ int huffman_encode_block_64(const float* block, uint8_t* encoded, int encoded_ma
 }
 
 int huffman_decode_block_64(const uint8_t* encoded, int encoded_len, float* block) {
-    constexpr int header_size = kNumSymbols * static_cast<int>(sizeof(uint16_t));
+    constexpr int header_size = kNumSymbols * static_cast<int>(sizeof(uint32_t));
     if (encoded_len < header_size) return -1;
 
-    const auto* freq = reinterpret_cast<const uint16_t*>(encoded);
+    const auto* freq = reinterpret_cast<const uint32_t*>(encoded);
     const int root = build_tree(freq);
     if (root < 0) return -1;
     build_codes(root);
@@ -186,36 +186,12 @@ int huffman_decode_block_64(const uint8_t* encoded, int encoded_len, float* bloc
 }
 
 int huffman_encode_bytes(const uint8_t* in_data, int in_len, uint8_t* encoded, int encoded_max_size) {
-    constexpr int header_size = kNumSymbols * static_cast<int>(sizeof(uint16_t));
+    constexpr int header_size = kNumSymbols * static_cast<int>(sizeof(uint32_t));
     if (encoded_max_size < header_size) return -1;
 
-    std::array<uint32_t, kNumSymbols> true_freq = {0};
-    for (int i = 0; i < in_len; ++i) {
-        ++true_freq[in_data[i]];
-    }
-
-    uint32_t max_freq = 0;
-    for (int i = 0; i < kNumSymbols; ++i) {
-        if (true_freq[i] > max_freq) max_freq = true_freq[i];
-    }
-
-    auto* freq = reinterpret_cast<uint16_t*>(encoded);
-    if (max_freq <= 65535) {
-        for (int i = 0; i < kNumSymbols; ++i) {
-            freq[i] = static_cast<uint16_t>(true_freq[i]);
-        }
-    } else {
-        const float scale = 65535.0f / static_cast<float>(max_freq);
-        for (int i = 0; i < kNumSymbols; ++i) {
-            if (true_freq[i] > 0) {
-                uint32_t scaled = static_cast<uint32_t>(true_freq[i] * scale);
-                if (scaled == 0) scaled = 1;
-                freq[i] = static_cast<uint16_t>(scaled);
-            } else {
-                freq[i] = 0;
-            }
-        }
-    }
+    auto* freq = reinterpret_cast<uint32_t*>(encoded);
+    std::fill(freq, freq + kNumSymbols, 0u);
+    for (int i = 0; i < in_len; ++i) ++freq[in_data[i]];
 
     const int root = build_tree(freq);
     if (root < 0) return -1;
@@ -240,16 +216,16 @@ int huffman_encode_bytes(const uint8_t* in_data, int in_len, uint8_t* encoded, i
     return header_size + byte_pos;
 }
 
-void huffman_prepare_codebook(const uint32_t histogram[256], uint32_t out_bits[256], uint8_t out_lens[256], uint16_t out_freq[256]) {
+void huffman_prepare_codebook(const uint32_t histogram[256], uint32_t out_bits[256], uint8_t out_lens[256], uint32_t out_freq[256]) {
     uint32_t max_freq = 0;
     for (int i = 0; i < 256; ++i) if (histogram[i] > max_freq) max_freq = histogram[i];
 
-    uint16_t freq[256];
+    uint32_t freq[256];
     if (max_freq <= 65535) {
-        for (int i = 0; i < 256; ++i) freq[i] = (uint16_t)histogram[i];
+        for (int i = 0; i < 256; ++i) freq[i] = (uint32_t)histogram[i];
     } else {
         float fscale = 65535.0f / (float)max_freq;
-        for (int i = 0; i < 256; ++i) freq[i] = (histogram[i] > 0) ? (uint16_t)std::max(1u, (uint32_t)(histogram[i] * fscale)) : 0;
+        for (int i = 0; i < 256; ++i) freq[i] = (histogram[i] > 0) ? (uint32_t)std::max(1u, (uint32_t)(histogram[i] * fscale)) : 0;
     }
 
     int root = build_tree(freq);
@@ -262,10 +238,10 @@ void huffman_prepare_codebook(const uint32_t histogram[256], uint32_t out_bits[2
     }
     std::memcpy(out_bits, code_bits.data(), 256 * sizeof(uint32_t));
     std::memcpy(out_lens, code_len.data(), 256 * sizeof(uint8_t));
-    std::memcpy(out_freq, freq, 256 * sizeof(uint16_t));
+    std::memcpy(out_freq, freq, 256 * sizeof(uint32_t));
 }
 
-int huffman_codebook_from_freq16(const uint16_t freq[256], uint32_t out_bits[256], uint8_t out_lens[256]) {
+int huffman_codebook_from_freq32(const uint32_t freq[256], uint32_t out_bits[256], uint8_t out_lens[256]) {
     const int root = build_tree(freq);
     if (root < 0) {
         std::memset(out_bits, 0, 256 * sizeof(uint32_t));
@@ -284,7 +260,7 @@ int huffman_codebook_from_freq16(const uint16_t freq[256], uint32_t out_bits[256
     return 0;
 }
 
-int huffman_decode_bit_window(const uint16_t freq[256], const uint8_t* packed, int packed_len_bytes,
+int huffman_decode_bit_window(const uint32_t freq[256], const uint8_t* packed, int packed_len_bytes,
                               int bit_start, int num_bits, uint8_t* out, int out_cap) {
     const int root = build_tree(freq);
     if (root < 0) return -1;
@@ -328,10 +304,10 @@ int huffman_decode_bit_window(const uint16_t freq[256], const uint8_t* packed, i
 }
 
 int huffman_decode_bytes(const uint8_t* encoded, int encoded_len, uint8_t* out_data, int out_len) {
-    constexpr int header_size = kNumSymbols * static_cast<int>(sizeof(uint16_t));
+    constexpr int header_size = kNumSymbols * static_cast<int>(sizeof(uint32_t));
     if (encoded_len < header_size) return -1;
 
-    const auto* freq = reinterpret_cast<const uint16_t*>(encoded);
+    const auto* freq = reinterpret_cast<const uint32_t*>(encoded);
     const int root = build_tree(freq);
     if (root < 0) return -1;
     build_codes(root);

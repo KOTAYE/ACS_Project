@@ -29,6 +29,9 @@ void cuda_decode_channel(int ch, const int16_t* coeff_in,
                          int pw, int ph, int block_size, bool is_keyframe);
 
 void cuda_rle_channel_indexed(int ch, int num_blocks, int block_size, uint32_t* out_rle_bytes);
+void cuda_rle_encode_async(int ch, int num_blocks, int block_size);
+uint8_t* cuda_get_bitstream_ptr(int ch);
+void cuda_get_pinned_metadata(int ch, uint32_t* rle_bytes, uint32_t* pack_bytes);
 void cuda_hist_channel_new(int ch, uint32_t* h_hist);
 
 void cuda_get_block_bit_lengths(int ch, int num_blocks, uint32_t* h_lengths);
@@ -40,7 +43,7 @@ void cuda_pack_channel_indexed(int ch, int num_blocks, int block_size,
 void cuda_full_decode_channel(int ch,
                                const uint8_t* h_packed_data, size_t packed_bytes,
                                const uint32_t* h_block_bit_lengths, int num_blocks,
-                               const uint16_t* h_freq,
+                               const uint32_t* h_freq,
                                int pw, int ph, int block_size, bool is_keyframe);
 
 int16_t* cuda_channel_d_coeff(int ch);

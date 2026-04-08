@@ -90,6 +90,8 @@ __global__ void encode_blocks_kernel(
     int16_t* coeffs, const float* qm, const int* zigzag,
     int padded_w, int padded_h, bool is_keyframe)
 {
+    const int tid = threadIdx.x;
+    if (tid >= BS * BS) return;
     int bx = blockIdx.x;
     int by = blockIdx.y;
     int x0 = bx * BS;
@@ -102,43 +104,81 @@ __global__ void encode_blocks_kernel(
     float* s_mid = s_buf + BS * BS;
     float* s_tmp = s_buf + 2 * BS * BS;
 
-    for (int r = 0; r < BS; ++r) {
-        for (int c = 0; c < BS; ++c) {
-            const int row = y0 + r;
-            const int col = x0 + c;
-            const int idx = row * padded_w + col;
-            const float val = ld_u8_as_float(src + idx);
-            if (!is_keyframe) {
-                const float pval = ld_u8_as_float(prev + idx);
-                s_blk[r * BS + c] = val - pval;
-            } else {
-                s_blk[r * BS + c] = val - 128.0f;
-            }
+    const int r = tid / BS;
+    const int c = tid % BS;
+    const int row = y0 + r;
+    const int col = x0 + c;
+    const int idx = row * padded_w + col;
+    const float val = ld_u8_as_float(src + idx);
+    if (!is_keyframe) {
+        const float pval = ld_u8_as_float(prev + idx);
+        s_blk[tid] = val - pval;
+    } else {
+        s_blk[tid] = val - 128.0f;
+    }
+    __syncthreads();
+
+    {
+        const int rr = tid / BS;
+        const int k = tid % BS;
+        float s = 0.f;
+        for (int n = 0; n < BS; ++n)
+            s += s_blk[rr * BS + n] * cosf(M_PI_F * (2.0f * n + 1.0f) * k / (2.0f * BS));
+        const float ck = (k == 0) ? 0.70710678118f : 1.0f;
+        s_tmp[rr * BS + k] = 0.5f * ck * s;
+    }
+    __syncthreads();
+
+    {
+        const int cc = tid % BS;
+        const int k = tid / BS;
+        float s = 0.f;
+        for (int n = 0; n < BS; ++n)
+            s += s_tmp[n * BS + cc] * cosf(M_PI_F * (2.0f * n + 1.0f) * k / (2.0f * BS));
+        const float ck = (k == 0) ? 0.70710678118f : 1.0f;
+        s_mid[k * BS + cc] = 0.5f * ck * s;
+    }
+    __syncthreads();
+
+    {
+        const int i = tid;
+        float q_val = roundf(s_mid[i] / qm[i]);
+        coeffs[block_idx * BS * BS + zigzag[i]] = static_cast<int16_t>(q_val);
+        s_mid[i] = q_val * qm[i];
+    }
+    __syncthreads();
+
+    {
+        const int cc = tid % BS;
+        const int n = tid / BS;
+        float s = 0.f;
+        for (int k = 0; k < BS; ++k) {
+            const float ck = (k == 0) ? 0.70710678118f : 1.0f;
+            s += ck * s_mid[k * BS + cc] * cosf(M_PI_F * (2.0f * n + 1.0f) * k / (2.0f * BS));
         }
+        s_tmp[n * BS + cc] = 0.5f * s;
     }
+    __syncthreads();
 
-    dct2d_device<BS>(s_blk, s_mid, s_tmp);
-
-    for (int i = 0; i < BS * BS; ++i) {
-        coeffs[block_idx * BS * BS + zigzag[i]] = static_cast<int16_t>(roundf(s_mid[i] / qm[i]));
-    }
-
-    idct2d_device<BS>(s_mid, s_blk, s_tmp);
-
-    for (int r = 0; r < BS; ++r) {
-        for (int c = 0; c < BS; ++c) {
-            float rval = s_blk[r * BS + c];
-            const int row = y0 + r;
-            const int col = x0 + c;
-            const int idx = row * padded_w + col;
-            if (!is_keyframe) {
-                rval += ld_u8_as_float(prev + idx);
-            } else {
-                rval += 128.0f;
-            }
-            recon[idx] = static_cast<uint8_t>(fminf(fmaxf(roundf(rval), 0.0f), 255.0f));
+    {
+        const int rr = tid / BS;
+        const int n = tid % BS;
+        float s = 0.f;
+        for (int k = 0; k < BS; ++k) {
+            const float ck = (k == 0) ? 0.70710678118f : 1.0f;
+            s += ck * s_tmp[rr * BS + k] * cosf(M_PI_F * (2.0f * n + 1.0f) * k / (2.0f * BS));
         }
+        s_blk[rr * BS + n] = 0.5f * s;
     }
+    __syncthreads();
+
+    float rval = s_blk[tid];
+    if (!is_keyframe) {
+        rval += ld_u8_as_float(prev + idx);
+    } else {
+        rval += 128.0f;
+    }
+    recon[idx] = static_cast<uint8_t>(fminf(fmaxf(roundf(rval), 0.0f), 255.0f));
 }
 
 template<int BS>
@@ -150,6 +190,8 @@ __global__ void decode_blocks_kernel(
         const int*     __restrict__ zigzag,
         int padded_w, int padded_h, bool is_keyframe)
 {
+    const int tid = threadIdx.x;
+    if (tid >= BS * BS) return;
     int bx = blockIdx.x;
     int by = blockIdx.y;
     int x0 = bx * BS;
@@ -162,49 +204,68 @@ __global__ void decode_blocks_kernel(
     float* s_spat  = s_buf + BS * BS;
     float* s_tmp   = s_buf + 2 * BS * BS;
 
-    
-    for (int j = 0; j < BS * BS; ++j) {
-        s_coeff[j] = static_cast<float>(coeff_in[block_idx * BS * BS + zigzag[j]]) * qm[j];
-    }
+    s_coeff[tid] = static_cast<float>(coeff_in[block_idx * BS * BS + zigzag[tid]]) * qm[tid];
+    __syncthreads();
 
-    idct2d_device<BS>(s_coeff, s_spat, s_tmp);
-
-    for (int r = 0; r < BS; ++r) {
-        for (int c = 0; c < BS; ++c) {
-            float rval = s_spat[r * BS + c];
-            const int row = y0 + r;
-            const int col = x0 + c;
-            const int idx = row * padded_w + col;
-            if (!is_keyframe) {
-                rval += ld_u8_as_float(prev + idx);
-            } else {
-                rval += 128.0f;
-            }
-            recon[idx] = static_cast<uint8_t>(fminf(fmaxf(roundf(rval), 0.0f), 255.0f));
+    {
+        const int cc = tid % BS;
+        const int n = tid / BS;
+        float s = 0.f;
+        for (int k = 0; k < BS; ++k) {
+            const float ck = (k == 0) ? 0.70710678118f : 1.0f;
+            s += ck * s_coeff[k * BS + cc] * cosf(M_PI_F * (2.0f * n + 1.0f) * k / (2.0f * BS));
         }
+        s_tmp[n * BS + cc] = 0.5f * s;
     }
+    __syncthreads();
+
+    {
+        const int rr = tid / BS;
+        const int n = tid % BS;
+        float s = 0.f;
+        for (int k = 0; k < BS; ++k) {
+            const float ck = (k == 0) ? 0.70710678118f : 1.0f;
+            s += ck * s_tmp[rr * BS + k] * cosf(M_PI_F * (2.0f * n + 1.0f) * k / (2.0f * BS));
+        }
+        s_spat[rr * BS + n] = 0.5f * s;
+    }
+    __syncthreads();
+
+    const int r = tid / BS;
+    const int c = tid % BS;
+    const int row = y0 + r;
+    const int col = x0 + c;
+    const int idx = row * padded_w + col;
+    float rval = s_spat[tid];
+    if (!is_keyframe) {
+        rval += ld_u8_as_float(prev + idx);
+    } else {
+        rval += 128.0f;
+    }
+    recon[idx] = static_cast<uint8_t>(fminf(fmaxf(roundf(rval), 0.0f), 255.0f));
 }
 
 
-struct ChannelBuf {
-    uint8_t *d_src_ping[2] = {nullptr, nullptr};
-    uint8_t *d_prev = nullptr, *d_curr = nullptr;
-    int16_t *d_coeff = nullptr;
-    size_t pixels = 0, coeffs = 0;
-    
-    
-    int16_t* d_rle = nullptr;
-    size_t rle_len = 0;
-    uint8_t* d_packed = nullptr;
-    size_t packed_bytes = 0;
+struct GpuChannel {
+    int pw, ph, pixels;
+    uint8_t *d_prev, *d_curr;
+    uint8_t *d_src_ping[2];
+    int16_t *d_coeff;
 
-    
-    uint32_t* d_block_bit_lengths = nullptr;
-    int pw = 0, ph = 0;
+    uint8_t*  d_packed;
+    size_t    packed_bytes;
+    uint32_t* d_block_bit_lengths;
+
+    struct PinnedMetadata {
+        uint32_t rle_bytes;
+        uint32_t pack_bytes;
+        uint32_t num_blocks;
+    } *h_metadata;
+    PinnedMetadata* d_metadata; // Phase 3: Device pointer for the same mapped memory
 };
 
 static constexpr int MAX_CH = 3;
-static ChannelBuf   g_ch[MAX_CH];
+static GpuChannel   g_ch[MAX_CH];
 static cudaStream_t g_stream[MAX_CH] = {};
 static cudaStream_t g_transfer_stream = nullptr;
 static float*       g_d_qm[2]       = {};
@@ -249,27 +310,35 @@ void cuda_alloc_frame_buffers(int width, int height, int channels,
 
     int total_coeffs_per_block = block_size * block_size;
     g_total_bytes = 0;
-    for (int ch = 0; ch < channels; ++ch) {
+    for (int i = 0; i < channels; ++i) {
         int w = width, h = height;
-        if (use_ycbcr && ch > 0 && channels == 3) { w = (width+1)/2; h = (height+1)/2; }
-        g_pw[ch] = pad_bs(w, block_size);
-        g_ph[ch] = pad_bs(h, block_size);
-        auto& b = g_ch[ch];
-        b.pixels = size_t(g_pw[ch]) * g_ph[ch];
-        b.coeffs = size_t(g_pw[ch]/block_size) * (g_ph[ch]/block_size) * total_coeffs_per_block;
-        b.pw = g_pw[ch]; b.ph = g_ph[ch];
-        rle_gpu_init(ch, b.coeffs);
-        g_total_bytes += b.pixels;
+        if (use_ycbcr && i > 0 && channels == 3) { w = (width+1)/2; h = (height+1)/2; }
+        int pw = pad_bs(w, block_size);
+        int ph = pad_bs(h, block_size);
+        g_ch[i].pw = pw; g_ch[i].ph = ph;
+        g_ch[i].pixels = pw * ph;
+        g_total_bytes += g_ch[i].pixels;
         
-        size_t bytes = b.pixels * sizeof(uint8_t);
-        CUDA_CHECK(cudaMalloc(&b.d_src_ping[0], bytes));
-        CUDA_CHECK(cudaMalloc(&b.d_src_ping[1], bytes));
-        CUDA_CHECK(cudaMalloc(&b.d_prev, bytes));
-        CUDA_CHECK(cudaMalloc(&b.d_curr, bytes));
-        CUDA_CHECK(cudaMemset(b.d_prev, 0, bytes));
-        CUDA_CHECK(cudaMemset(b.d_curr, 0, bytes));
-        CUDA_CHECK(cudaMalloc(&b.d_coeff, b.coeffs * sizeof(int16_t)));
-        CUDA_CHECK(cudaMalloc(&b.d_block_bit_lengths, (b.coeffs / (block_size * block_size)) * sizeof(uint32_t)));
+        size_t bytes = g_ch[i].pixels * sizeof(uint8_t);
+        CUDA_CHECK(cudaMalloc(&g_ch[i].d_src_ping[0], bytes));
+        CUDA_CHECK(cudaMalloc(&g_ch[i].d_src_ping[1], bytes));
+        CUDA_CHECK(cudaMalloc(&g_ch[i].d_prev, bytes));
+        CUDA_CHECK(cudaMalloc(&g_ch[i].d_curr, bytes));
+        CUDA_CHECK(cudaMemset(g_ch[i].d_prev, 0, bytes));
+        CUDA_CHECK(cudaMemset(g_ch[i].d_curr, 0, bytes));
+        size_t cf_bytes = (size_t)pw * ph * sizeof(int16_t);
+        CUDA_CHECK(cudaMalloc(&g_ch[i].d_coeff, cf_bytes));
+        CUDA_CHECK(cudaMemset(g_ch[i].d_coeff, 0, cf_bytes));
+
+        size_t nb = (size_t)(pw / block_size) * (ph / block_size);
+        CUDA_CHECK(cudaMalloc(&g_ch[i].d_block_bit_lengths, nb * sizeof(uint32_t)));
+
+        rle_gpu_init(i, pw * ph); // Correctly initialize RLE context for this channel
+        CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&g_ch[i].h_metadata), sizeof(GpuChannel::PinnedMetadata), cudaHostAllocMapped));
+        CUDA_CHECK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&g_ch[i].d_metadata), g_ch[i].h_metadata, 0));
+        g_ch[i].h_metadata->num_blocks = (uint32_t)nb;
+        g_ch[i].h_metadata->rle_bytes = 0;
+        g_ch[i].h_metadata->pack_bytes = 0;
     }
 
     CUDA_CHECK(cudaMalloc(&g_d_qm[0], total_coeffs_per_block*sizeof(float)));
@@ -293,15 +362,19 @@ void cuda_alloc_frame_buffers(int width, int height, int channels,
 
 void cuda_free_frame_buffers() {
     if (!g_allocated) return;
-    for (int ch = 0; ch < g_num_ch; ++ch) {
-        auto& b = g_ch[ch];
-        cudaFree(b.d_src_ping[0]); cudaFree(b.d_src_ping[1]);
-        cudaFree(b.d_prev);
-        cudaFree(b.d_curr); cudaFree(b.d_coeff);
-        cudaFree(b.d_block_bit_lengths);
-        
-        g_ch[ch] = {};
+    for (int i = 0; i < g_num_ch; ++i) {
+        cudaFree(g_ch[i].d_src_ping[0]); cudaFree(g_ch[i].d_src_ping[1]);
+        cudaFree(g_ch[i].d_prev);
+        cudaFree(g_ch[i].d_curr);
+        cudaFree(g_ch[i].d_coeff);
+        cudaFree(g_ch[i].d_block_bit_lengths);
+        if (g_ch[i].h_metadata) {
+            cudaFreeHost(g_ch[i].h_metadata); 
+        }
+        g_ch[i].h_metadata = nullptr;
+        g_ch[i].d_metadata = nullptr;
     }
+    rle_gpu_cleanup();
     for (auto& p : g_d_qm) { cudaFree(p); p = nullptr; }
     if (g_d_zigzag) { cudaFree(g_d_zigzag); g_d_zigzag = nullptr; }
     if (g_h_rgb_in)  { cudaFreeHost(g_h_rgb_in);  g_h_rgb_in  = nullptr; }
@@ -369,13 +442,13 @@ void cuda_encode_channel(int ch, int pw, int ph, int block_size, bool is_keyfram
     const size_t shared_mem = 3u * (size_t)block_size * (size_t)block_size * sizeof(float);
 
     if (block_size == 8) {
-        encode_blocks_kernel<8><<<grid, 1, shared_mem, stream>>>(
+        encode_blocks_kernel<8><<<grid, 64, shared_mem, stream>>>(
             d_src, buf.d_prev, buf.d_curr, buf.d_coeff, qm, g_d_zigzag, pw, ph, is_keyframe);
     } else if (block_size == 16) {
-        encode_blocks_kernel<16><<<grid, 1, shared_mem, stream>>>(
+        encode_blocks_kernel<16><<<grid, 256, shared_mem, stream>>>(
             d_src, buf.d_prev, buf.d_curr, buf.d_coeff, qm, g_d_zigzag, pw, ph, is_keyframe);
     } else if (block_size == 32) {
-        encode_blocks_kernel<32><<<grid, 1, shared_mem, stream>>>(
+        encode_blocks_kernel<32><<<grid, 1024, shared_mem, stream>>>(
             d_src, buf.d_prev, buf.d_curr, buf.d_coeff, qm, g_d_zigzag, pw, ph, is_keyframe);
     }
     CUDA_CHECK(cudaGetLastError());
@@ -428,13 +501,13 @@ void cuda_decode_channel(int ch, const int16_t* coeff_in,
     const size_t shared_mem = 3u * (size_t)block_size * (size_t)block_size * sizeof(float);
 
     if (block_size == 8) {
-        decode_blocks_kernel<8><<<grid, 1, shared_mem, stream>>>(
+        decode_blocks_kernel<8><<<grid, 64, shared_mem, stream>>>(
             buf.d_coeff, buf.d_prev, buf.d_curr, qm, g_d_zigzag, pw, ph, is_keyframe);
     } else if (block_size == 16) {
-        decode_blocks_kernel<16><<<grid, 1, shared_mem, stream>>>(
+        decode_blocks_kernel<16><<<grid, 256, shared_mem, stream>>>(
             buf.d_coeff, buf.d_prev, buf.d_curr, qm, g_d_zigzag, pw, ph, is_keyframe);
     } else if (block_size == 32) {
-        decode_blocks_kernel<32><<<grid, 1, shared_mem, stream>>>(
+        decode_blocks_kernel<32><<<grid, 1024, shared_mem, stream>>>(
             buf.d_coeff, buf.d_prev, buf.d_curr, qm, g_d_zigzag, pw, ph, is_keyframe);
     }
     CUDA_CHECK(cudaGetLastError());
@@ -469,7 +542,7 @@ void cuda_memcpy_to_host(void* host_ptr, const void* device_ptr, size_t bytes) {
 void cuda_full_decode_channel(int ch,
                                const uint8_t* h_packed_data, size_t packed_bytes,
                                const uint32_t* h_block_bit_lengths, int num_blocks,
-                               const uint16_t* h_freq,
+                               const uint32_t* h_freq,
                                int pw, int ph, int block_size, bool is_keyframe) {
     auto& buf    = g_ch[ch];
     auto  stream = g_stream[ch];
@@ -489,13 +562,13 @@ void cuda_full_decode_channel(int ch,
     const size_t shared_mem = 3u * (size_t)block_size * (size_t)block_size * sizeof(float);
 
     if (block_size == 8) {
-        decode_blocks_kernel<8><<<grid, 1, shared_mem, stream>>>(
+        decode_blocks_kernel<8><<<grid, 64, shared_mem, stream>>>(
             buf.d_coeff, buf.d_prev, buf.d_curr, qm, g_d_zigzag, pw, ph, is_keyframe);
     } else if (block_size == 16) {
-        decode_blocks_kernel<16><<<grid, 1, shared_mem, stream>>>(
+        decode_blocks_kernel<16><<<grid, 256, shared_mem, stream>>>(
             buf.d_coeff, buf.d_prev, buf.d_curr, qm, g_d_zigzag, pw, ph, is_keyframe);
     } else if (block_size == 32) {
-        decode_blocks_kernel<32><<<grid, 1, shared_mem, stream>>>(
+        decode_blocks_kernel<32><<<grid, 1024, shared_mem, stream>>>(
             buf.d_coeff, buf.d_prev, buf.d_curr, qm, g_d_zigzag, pw, ph, is_keyframe);
     }
     CUDA_CHECK(cudaGetLastError());
@@ -508,14 +581,30 @@ void cuda_get_block_bit_lengths(int ch, int num_blocks, uint32_t* h_lengths) {
 void cuda_pack_channel_indexed(int ch, int num_blocks, int block_size,
                                const uint32_t h_code_bits[256], const uint8_t h_code_lens[256],
                                uint8_t** d_packed_ptr, size_t* out_packed_bytes,
-                               uint32_t* d_block_bit_lengths_ptr) {
+                               uint32_t* d_block_bit_lengths_out) {
     auto& buf = g_ch[ch];
     auto  stream = g_stream[ch];
 
     cuda_huffman_pack_gpu_indexed(ch, num_blocks,
                                   h_code_bits, h_code_lens, &buf.d_packed, &buf.packed_bytes, 
-                                  buf.d_block_bit_lengths, stream);
+                                  buf.d_block_bit_lengths, buf.h_metadata, stream);
     
-    *d_packed_ptr = buf.d_packed;
-    *out_packed_bytes = buf.packed_bytes;
+    if (d_packed_ptr) *d_packed_ptr = buf.d_packed;
+    if (out_packed_bytes) *out_packed_bytes = buf.packed_bytes;
+}
+
+void cuda_get_pinned_metadata(int ch, uint32_t* rle_bytes, uint32_t* pack_bytes) {
+    auto& buf = g_ch[ch];
+    if (rle_bytes) *rle_bytes = buf.h_metadata->rle_bytes;
+    if (pack_bytes) *pack_bytes = buf.h_metadata->pack_bytes;
+}
+
+void cuda_rle_encode_async(int ch, int num_blocks, int block_size) {
+    auto& buf = g_ch[ch];
+    auto  stream = g_stream[ch];
+    cuda_rle_encode_indexed(ch, buf.d_coeff, num_blocks, block_size, buf.d_metadata, stream);
+}
+
+uint8_t* cuda_get_bitstream_ptr(int ch) {
+    return g_ch[ch].d_packed;
 }

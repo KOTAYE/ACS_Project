@@ -117,7 +117,7 @@ struct PinnedCoeffs {
 struct EncodedChannel {
     uint32_t rle_bytes;
     uint32_t enc_len;
-    uint16_t huffman_freq[256];
+    uint32_t huffman_freq[256];
     std::vector<uint32_t> block_bit_lengths;
     std::vector<uint8_t> data;
 };
@@ -278,7 +278,6 @@ void compress_flipbook(const std::string& in_dir, const std::string& out_path, i
                 cuda_encode_channel(ch, pw[ch], ph[ch], block_size, ef.is_keyframe, src_slot);
                 if (ch + 1 == img_ch)
                     cuda_record_encode_slot_done(src_slot, ch);
-                cuda_sync_channel(ch);
             }
 
             Frame f_next;
@@ -290,46 +289,45 @@ void compress_flipbook(const std::string& in_dir, const std::string& out_path, i
                 h2d_current_already_queued = true;
             }
 
+            // Pass 1: Launch all kernels asynchronously for all channels
             for (int ch = 0; ch < img_ch; ++ch) {
                 const int num_blocks = (pw[ch] / block_size) * (ph[ch] / block_size);
                 void* stream = cuda_channel_stream_ptr(ch);
+                
+                cuda_rle_encode_async(ch, num_blocks, block_size);
+                cuda_compute_histogram(ch, nullptr, stream);
+                cuda_prepare_huffman_codebook_gpu(ch, stream);
+                cuda_pack_channel_indexed(ch, num_blocks, block_size, nullptr, nullptr, nullptr, nullptr, nullptr);
+            }
+
+            // PASS 2: Wait for all work to complete (One single sync per frame)
+            cuda_sync_all();
+
+            // PASS 3: Download metadata and data
+            for (int ch = 0; ch < img_ch; ++ch) {
+                const int num_blocks = (pw[ch] / block_size) * (ph[ch] / block_size);
                 uint32_t rle_byte_len = 0;
-                cuda_rle_encode_indexed(ch, cuda_channel_d_coeff(ch), num_blocks, block_size, &rle_byte_len,
-                                        stream);
-                cuda_sync_channel(ch);
-
+                uint32_t pack_len = 0;
+                
+                cuda_get_pinned_metadata(ch, &rle_byte_len, &pack_len);
                 ef.channels[ch].rle_bytes = rle_byte_len;
+                ef.channels[ch].enc_len = pack_len;
                 ef.channels[ch].block_bit_lengths.resize(static_cast<size_t>(num_blocks));
-
-                if (rle_byte_len == 0) {
-                    std::memset(ef.channels[ch].huffman_freq, 0, sizeof(ef.channels[ch].huffman_freq));
-                    ef.channels[ch].enc_len = 0;
-                    ef.channels[ch].data.clear();
-                    std::fill(ef.channels[ch].block_bit_lengths.begin(), ef.channels[ch].block_bit_lengths.end(),
-                              0u);
+                
+                if (rle_byte_len > 0) {
+                    cuda_huffman_download_block_bit_lengths(ch, ef.channels[ch].block_bit_lengths.data(), num_blocks);
+                    ef.channels[ch].data.resize(pack_len);
+                    uint8_t* d_pack = cuda_get_bitstream_ptr(ch);
+                    if (pack_len > 0 && d_pack) {
+                        cuda_memcpy_to_host(ef.channels[ch].data.data(), d_pack, pack_len);
+                    }
+                    // Since we stay offline, we store a placeholder frequency - the decoder will use d_hist or we can download it.
+                    // Actually we need frequencies on host for the file header.
+                    cuda_compute_histogram(ch, (uint32_t*)ef.channels[ch].huffman_freq, nullptr); // This is just a copy now
                 } else {
-                    uint32_t h_hist[256];
-                    cuda_compute_histogram(ch, h_hist, stream);
-                    cuda_sync_channel(ch);
-
-                    uint32_t code_bits[256];
-                    uint8_t code_lens[256];
-                    uint16_t freq_out[256];
-                    huffman_prepare_codebook(h_hist, code_bits, code_lens, freq_out);
-                    std::memcpy(ef.channels[ch].huffman_freq, freq_out, sizeof(ef.channels[ch].huffman_freq));
-
-                    uint8_t* d_pack = nullptr;
-                    size_t pack_sz = 0;
-                    cuda_huffman_pack_gpu_indexed(ch, num_blocks, code_bits, code_lens, &d_pack, &pack_sz,
-                                                  nullptr, stream);
-                    cuda_sync_channel(ch);
-
-                    cuda_huffman_download_block_bit_lengths(ch, ef.channels[ch].block_bit_lengths.data(),
-                                                            num_blocks);
-                    ef.channels[ch].enc_len = static_cast<uint32_t>(pack_sz);
-                    ef.channels[ch].data.resize(pack_sz);
-                    if (pack_sz > 0 && d_pack)
-                        cuda_memcpy_to_host(ef.channels[ch].data.data(), d_pack, pack_sz);
+                    std::memset(ef.channels[ch].huffman_freq, 0, sizeof(ef.channels[ch].huffman_freq));
+                    ef.channels[ch].data.clear();
+                    std::fill(ef.channels[ch].block_bit_lengths.begin(), ef.channels[ch].block_bit_lengths.end(), 0u);
                 }
             }
 
@@ -352,7 +350,7 @@ void compress_flipbook(const std::string& in_dir, const std::string& out_path, i
             struct ChData {
                 uint32_t rle_bytes;
                 uint32_t enc_len;
-                uint16_t huffman_freq[256];
+                uint32_t huffman_freq[256];
                 std::vector<uint32_t> block_bit_lengths;
                 std::vector<uint8_t> data;
             };
@@ -364,7 +362,7 @@ void compress_flipbook(const std::string& in_dir, const std::string& out_path, i
         for (int ch = 0; ch < img_ch; ++ch) {
             fwd.channels[ch].rle_bytes = ef.channels[ch].rle_bytes;
             fwd.channels[ch].enc_len = ef.channels[ch].enc_len;
-            std::memcpy(fwd.channels[ch].huffman_freq, ef.channels[ch].huffman_freq, 512);
+            std::memcpy(fwd.channels[ch].huffman_freq, ef.channels[ch].huffman_freq, sizeof(fwd.channels[ch].huffman_freq));
             fwd.channels[ch].block_bit_lengths = std::move(ef.channels[ch].block_bit_lengths);
             fwd.channels[ch].data = std::move(ef.channels[ch].data);
         }
@@ -376,7 +374,7 @@ void compress_flipbook(const std::string& in_dir, const std::string& out_path, i
                 out.write(reinterpret_cast<const char*>(&cd.enc_len), 4);
                 uint32_t num_blocks = static_cast<uint32_t>(cd.block_bit_lengths.size());
                 out.write(reinterpret_cast<const char*>(&num_blocks), 4);
-                out.write(reinterpret_cast<const char*>(cd.huffman_freq), 512);
+                out.write(reinterpret_cast<const char*>(cd.huffman_freq), sizeof(cd.huffman_freq));
                 out.write(reinterpret_cast<const char*>(cd.block_bit_lengths.data()), num_blocks * sizeof(uint32_t));
                 if (!cd.data.empty())
                     out.write(reinterpret_cast<const char*>(cd.data.data()), cd.data.size());
@@ -471,8 +469,8 @@ void decompress_flipbook(const std::string& in_path, const std::string& out_dir)
             if (static_cast<int>(channel_buffer.size()) < samples) channel_buffer.resize(samples);
 
             if (len32 > 0) {
-                std::vector<uint16_t> h_freq(256);
-                in.read(reinterpret_cast<char*>(h_freq.data()), 512);
+                std::vector<uint32_t> h_freq(256);
+                in.read(reinterpret_cast<char*>(h_freq.data()), h_freq.size() * sizeof(uint32_t));
 
                 std::vector<uint32_t> block_bit_lengths(num_blocks);
                 in.read(reinterpret_cast<char*>(block_bit_lengths.data()), num_blocks * sizeof(uint32_t));
@@ -499,9 +497,9 @@ void decompress_flipbook(const std::string& in_path, const std::string& out_dir)
                         cuda_sync_channel(ch);
                     }
                 } else {
-                    std::vector<uint8_t> enc_with_hdr(512 + len32);
-                    std::memcpy(enc_with_hdr.data(), h_freq.data(), 512);
-                    std::memcpy(enc_with_hdr.data() + 512, encoded.data(), len32);
+                    std::vector<uint8_t> enc_with_hdr(sizeof(uint32_t) * 256 + len32);
+                    std::memcpy(enc_with_hdr.data(), h_freq.data(), sizeof(uint32_t) * 256);
+                    std::memcpy(enc_with_hdr.data() + sizeof(uint32_t) * 256, encoded.data(), len32);
 
                     std::vector<int16_t> rle_buf(rle_bytes_len / sizeof(int16_t));
                     if (huffman_decode_bytes(enc_with_hdr.data(), static_cast<int>(enc_with_hdr.size()),
