@@ -10,6 +10,8 @@
 #include <chrono>
 #include <array>
 #include <cstring>
+#include <cmath>
+#include <cstdlib>
 
 #ifdef USE_OMP
 #include <omp.h>
@@ -45,6 +47,49 @@ inline int codec_pad(int n, int bs) { return ((n + bs - 1) / bs) * bs; }
 
 inline void level_shift_n(float* b, int n, float d) {
     for (int i = 0; i < n; ++i) b[i] += d;
+}
+
+inline float clampf(float v, float lo, float hi) {
+    return std::max(lo, std::min(v, hi));
+}
+
+inline float block_quant_scale(const float* residual, int n, bool adaptive_roi, float roi_strength) {
+    if (!adaptive_roi) {
+        return 1.0f;
+    }
+    float sum_abs = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        sum_abs += std::fabs(residual[i]);
+    }
+    const float avg_abs = sum_abs / static_cast<float>(n);
+    const float importance = 1.0f - std::exp(-avg_abs / 18.0f);
+    const float scale = 1.0f + roi_strength * (0.5f - importance);
+    return clampf(scale, 0.60f, 1.60f);
+}
+
+inline void quantize_block_scaled(float* block, const QuantMatrix& qm, int size, float scale) {
+    for (int i = 0; i < size; ++i) {
+        block[i] = std::roundf(block[i] / (qm[i] * scale));
+    }
+}
+
+inline void dequantize_block_scaled(float* block, const QuantMatrix& qm, int size, float scale) {
+    for (int i = 0; i < size; ++i) {
+        block[i] *= (qm[i] * scale);
+    }
+}
+
+inline double mean_abs_diff_u8(const uint8_t* a, const uint8_t* b, size_t n) {
+    if (!a || !b || n == 0) return 0.0;
+    uint64_t sum = 0;
+    for (size_t i = 0; i < n; ++i) {
+        sum += static_cast<uint32_t>(std::abs(static_cast<int>(a[i]) - static_cast<int>(b[i])));
+    }
+    return static_cast<double>(sum) / static_cast<double>(n);
+}
+
+inline int clamp_quality(int q) {
+    return std::max(5, std::min(100, q));
 }
 
 } 
@@ -106,7 +151,9 @@ static void rle_decode_macroblock(const int16_t* rle, int rle_elem_count, int16_
 #include "image_io.h"
 
 void compress_flipbook(const std::string& in_dir, const std::string& out_path, int quality, int block_size,
-                       bool use_ycbcr) {
+                       bool use_ycbcr, bool adaptive_roi, float roi_strength, const std::string& heatmap_video_path,
+                       float target_size_mb, float scene_cut_threshold, bool /*motion_predict*/,
+                       int /*motion_search_radius*/) {
     if (block_size != 8 && block_size != 16 && block_size != 32) {
         std::cerr << "Error: block_size must be 8, 16, or 32.\n";
         return;
@@ -145,6 +192,7 @@ void compress_flipbook(const std::string& in_dir, const std::string& out_path, i
     }
 
     BinHeader header;
+    header.magic[3] = '5';
     header.width = img_w;
     header.height = img_h;
     header.channels = img_ch;
@@ -154,8 +202,13 @@ void compress_flipbook(const std::string& in_dir, const std::string& out_path, i
     header.use_ycbcr = use_ycbcr ? 1 : 0;
     out.write(reinterpret_cast<const char*>(&header), sizeof(header));
 
-    const QuantMatrix luma_qm = make_quant_matrix(kJpegLumaQuant, quality, block_size);
-    const QuantMatrix chroma_qm = make_quant_matrix(kJpegChromaQuant, quality, block_size);
+    const bool rc_enabled = target_size_mb > 0.0f;
+    const size_t target_size_bytes = rc_enabled
+        ? static_cast<size_t>(target_size_mb * 1024.0f * 1024.0f)
+        : 0u;
+    size_t encoded_bytes_so_far = sizeof(header);
+    int rc_quality = clamp_quality(quality);
+
     const std::vector<int> zigzag = codec_zigzag_scan_table(block_size);
     const int bs = block_size;
     const int bpp = bs * bs;
@@ -165,6 +218,21 @@ void compress_flipbook(const std::string& in_dir, const std::string& out_path, i
 
     std::vector<int16_t> channel_buffer;
     std::vector<uint8_t> encoded;
+    std::vector<float> frame_luma_scales;
+    std::string heatmap_data_dir;
+    std::ofstream heatmap_manifest;
+    bool emit_heatmap = !heatmap_video_path.empty();
+    if (emit_heatmap) {
+        heatmap_data_dir = out_path + ".heatmap_data";
+        fs::create_directories(heatmap_data_dir);
+        heatmap_manifest.open(heatmap_data_dir + "/manifest.tsv", std::ios::trunc);
+        if (!heatmap_manifest) {
+            std::cerr << "Warning: failed to create heatmap manifest; heatmap video disabled.\n";
+            emit_heatmap = false;
+        } else {
+            heatmap_manifest << "frame_idx\tblocks_x\tblocks_y\tmap_file\tsource_frame\n";
+        }
+    }
 
     std::cout << "Compressing " << frames.size() << " frames into " << out_path << "...\n";
     auto t_compress_start = std::chrono::high_resolution_clock::now();
@@ -172,6 +240,8 @@ void compress_flipbook(const std::string& in_dir, const std::string& out_path, i
 #ifdef USE_OMP
     std::future<std::vector<uint8_t>> prefetch_interleaved;
 #endif
+
+    std::vector<uint8_t> prev_input_luma;
 
     for (size_t f_idx = 0; f_idx < frames.size(); ++f_idx) {
         std::vector<uint8_t> interleaved;
@@ -213,7 +283,20 @@ void compress_flipbook(const std::string& in_dir, const std::string& out_path, i
 
         Frame current = rgb_to_planes_parallel(interleaved.data(), img_w, img_h, img_ch, use_ycbcr, block_size);
 
-        bool is_keyframe = (f_idx == 0);
+        const int luma_pixels = current.padded_width[0] * current.padded_height[0];
+        const uint8_t* curr_luma = current.channel_ptr(0);
+        const bool scene_cut = (f_idx > 0 && scene_cut_threshold > 0.0f && !prev_input_luma.empty() &&
+            mean_abs_diff_u8(curr_luma, prev_input_luma.data(), static_cast<size_t>(luma_pixels)) >= scene_cut_threshold);
+        bool is_keyframe = (f_idx == 0) || scene_cut;
+        const int frame_quality = rc_enabled ? rc_quality : quality;
+        const QuantMatrix luma_qm = make_quant_matrix(kJpegLumaQuant, frame_quality, block_size);
+        const QuantMatrix chroma_qm = make_quant_matrix(kJpegChromaQuant, frame_quality, block_size);
+
+        uint8_t keyframe_marker = is_keyframe ? 1u : 0u;
+        uint8_t frame_quality_marker = static_cast<uint8_t>(frame_quality);
+        out.write(reinterpret_cast<const char*>(&keyframe_marker), 1);
+        out.write(reinterpret_cast<const char*>(&frame_quality_marker), 1);
+        size_t frame_bytes = 2;
 
         for (int ch = 0; ch < current.channels; ++ch) {
             const QuantMatrix& qm = (ch == 0) ? luma_qm : chroma_qm;
@@ -227,18 +310,63 @@ void compress_flipbook(const std::string& in_dir, const std::string& out_path, i
             const int blocks_y = padded_h / bs;
             const int total_blocks = blocks_x * blocks_y;
             const int channel_samples = total_blocks * bpp;
+            if (ch == 0 && emit_heatmap) {
+                frame_luma_scales.assign(static_cast<size_t>(total_blocks), 1.0f);
+            }
 
             if (static_cast<int>(channel_buffer.size()) < channel_samples)
                 channel_buffer.resize(channel_samples);
 
 #ifdef USE_OMP
-#pragma omp parallel for
-#endif
-            for (int by = 0; by < blocks_y; ++by) {
+#pragma omp parallel
+            {
                 std::vector<float> block_in(static_cast<size_t>(bpp));
                 std::vector<float> prev_block(static_cast<size_t>(bpp));
                 std::vector<float> dct_out(static_cast<size_t>(bpp));
                 std::vector<float> idct_out(static_cast<size_t>(bpp));
+#pragma omp for
+                for (int by = 0; by < blocks_y; ++by) {
+                    for (int bx = 0; bx < blocks_x; ++bx) {
+                        int sample_idx = (by * blocks_x + bx) * bpp;
+                        extract_block_n(src_channel, padded_w, bx, by, bs, block_in.data());
+
+                        if (!is_keyframe) {
+                            extract_block_n(prev_channel, padded_w, bx, by, bs, prev_block.data());
+                            for (int i = 0; i < bpp; ++i) block_in[i] -= prev_block[i];
+                        } else {
+                            level_shift_n(block_in.data(), bpp, -128.0f);
+                        }
+
+                        dct2d_separable_n(block_in.data(), dct_out.data(), bs);
+                        const int block_id = by * blocks_x + bx;
+                        const float q_scale = block_quant_scale(block_in.data(), bpp, adaptive_roi, roi_strength);
+                        if (ch == 0 && emit_heatmap) {
+                            frame_luma_scales[static_cast<size_t>(block_id)] = q_scale;
+                        }
+                        quantize_block_scaled(dct_out.data(), qm, bpp, q_scale);
+
+                        for (int i = 0; i < bpp; ++i)
+                            channel_buffer[sample_idx + zigzag[i]] = static_cast<int16_t>(dct_out[i]);
+
+                        dequantize_block_scaled(dct_out.data(), qm, bpp, q_scale);
+                        idct2d_separable_n(dct_out.data(), idct_out.data(), bs);
+
+                        if (!is_keyframe) {
+                            for (int i = 0; i < bpp; ++i) idct_out[i] += prev_block[i];
+                        } else {
+                            level_shift_n(idct_out.data(), bpp, 128.0f);
+                        }
+
+                        insert_block_n(recon_channel, padded_w, bx, by, bs, idct_out.data());
+                    }
+                }
+            }
+#else
+            std::vector<float> block_in(static_cast<size_t>(bpp));
+            std::vector<float> prev_block(static_cast<size_t>(bpp));
+            std::vector<float> dct_out(static_cast<size_t>(bpp));
+            std::vector<float> idct_out(static_cast<size_t>(bpp));
+            for (int by = 0; by < blocks_y; ++by) {
                 for (int bx = 0; bx < blocks_x; ++bx) {
                     int sample_idx = (by * blocks_x + bx) * bpp;
                     extract_block_n(src_channel, padded_w, bx, by, bs, block_in.data());
@@ -251,12 +379,17 @@ void compress_flipbook(const std::string& in_dir, const std::string& out_path, i
                     }
 
                     dct2d_separable_n(block_in.data(), dct_out.data(), bs);
-                    quantize_block(dct_out.data(), qm, bpp);
+                    const int block_id = by * blocks_x + bx;
+                    const float q_scale = block_quant_scale(block_in.data(), bpp, adaptive_roi, roi_strength);
+                    if (ch == 0 && emit_heatmap) {
+                        frame_luma_scales[static_cast<size_t>(block_id)] = q_scale;
+                    }
+                    quantize_block_scaled(dct_out.data(), qm, bpp, q_scale);
 
                     for (int i = 0; i < bpp; ++i)
                         channel_buffer[sample_idx + zigzag[i]] = static_cast<int16_t>(dct_out[i]);
 
-                    dequantize_block(dct_out.data(), qm, bpp);
+                    dequantize_block_scaled(dct_out.data(), qm, bpp, q_scale);
                     idct2d_separable_n(dct_out.data(), idct_out.data(), bs);
 
                     if (!is_keyframe) {
@@ -268,6 +401,7 @@ void compress_flipbook(const std::string& in_dir, const std::string& out_path, i
                     insert_block_n(recon_channel, padded_w, bx, by, bs, idct_out.data());
                 }
             }
+#endif
 
             std::vector<int16_t> current_ch_buffer(channel_buffer.begin(),
                                                    channel_buffer.begin() + channel_samples);
@@ -306,10 +440,42 @@ void compress_flipbook(const std::string& in_dir, const std::string& out_path, i
             out.write(reinterpret_cast<const char*>(bl.data()), nb * sizeof(uint32_t));
             if (payload > 0)
                 out.write(reinterpret_cast<const char*>(encoded.data() + sizeof(uint32_t) * 256), payload);
+            frame_bytes += 4 + 4 + 4 + (256 * sizeof(uint32_t)) + (static_cast<size_t>(nb) * sizeof(uint32_t)) + payload;
+        }
+
+        prev_input_luma.assign(curr_luma, curr_luma + static_cast<size_t>(luma_pixels));
+        if (rc_enabled) {
+            const size_t remain_before = (target_size_bytes > encoded_bytes_so_far)
+                ? (target_size_bytes - encoded_bytes_so_far) : 1u;
+            const double budget_this = static_cast<double>(remain_before) /
+                                       static_cast<double>(std::max<size_t>(1, frames.size() - f_idx));
+            encoded_bytes_so_far += frame_bytes;
+            if (f_idx + 1 < frames.size()) {
+                const double rel_err = (budget_this > 1.0) ? (static_cast<double>(frame_bytes) / budget_this - 1.0) : 0.0;
+                int step = static_cast<int>(std::round(rel_err * 10.0));
+                if (step > 0) {
+                    rc_quality = clamp_quality(rc_quality - std::min(8, step));
+                } else if (step < 0) {
+                    rc_quality = clamp_quality(rc_quality + std::min(4, -step));
+                }
+            }
         }
 
         std::swap(curr_recon.data, prev_recon.data);
         frame_destroy(current);
+        if (emit_heatmap && !frame_luma_scales.empty()) {
+            const int blocks_x = prev_recon.padded_width[0] / bs;
+            const int blocks_y = prev_recon.padded_height[0] / bs;
+            const fs::path map_name = "frame_" + std::to_string(f_idx) + ".bin";
+            const fs::path map_path = fs::path(heatmap_data_dir) / map_name;
+            std::ofstream map_out(map_path, std::ios::binary);
+            if (map_out) {
+                map_out.write(reinterpret_cast<const char*>(frame_luma_scales.data()),
+                              static_cast<std::streamsize>(frame_luma_scales.size() * sizeof(float)));
+                heatmap_manifest << f_idx << "\t" << blocks_x << "\t" << blocks_y << "\t"
+                                << map_name.string() << "\t" << frames[f_idx] << "\n";
+            }
+        }
         std::cout << "\r  Progress: " << f_idx + 1 << "/" << frames.size() << std::flush;
     }
     auto t_compress_end = std::chrono::high_resolution_clock::now();
@@ -327,6 +493,23 @@ void compress_flipbook(const std::string& in_dir, const std::string& out_path, i
               << " raw_bytes=" << raw_size
               << " compressed_bytes=" << file_size
               << " compression_ratio=" << ratio << "\n";
+    if (rc_enabled) {
+        std::cout << "  [RATE_CONTROL] target_mb=" << target_size_mb
+                  << " actual_mb=" << (static_cast<double>(file_size) / (1024.0 * 1024.0))
+                  << " final_quality=" << rc_quality << "\n";
+    }
+    if (emit_heatmap) {
+        heatmap_manifest.close();
+        std::string cmd = "python scripts/make_heatmap_video.py --manifest \"" + heatmap_data_dir +
+                          "/manifest.tsv\" --output \"" + heatmap_video_path + "\"";
+        const int rc = std::system(cmd.c_str());
+        if (rc != 0) {
+            std::cerr << "Heatmap video generation failed (exit code " << rc
+                      << "). Run the script manually.\n";
+        } else {
+            std::cout << "  Heatmap video written to: " << heatmap_video_path << "\n";
+        }
+    }
 
     frame_destroy(prev_recon);
     frame_destroy(curr_recon);
@@ -341,11 +524,15 @@ void decompress_flipbook(const std::string& in_path, const std::string& out_dir)
 
     BinHeader header;
     in.read(reinterpret_cast<char*>(&header), sizeof(header));
-    if (in.gcount() != sizeof(header) || header.magic[0] != 'F' || header.magic[1] != 'L' ||
-        header.magic[2] != 'I' || header.magic[3] != '3') {
+    const bool valid_magic = (in.gcount() == sizeof(header) && header.magic[0] == 'F' &&
+        header.magic[1] == 'L' && header.magic[2] == 'I' &&
+        (header.magic[3] == '3' || header.magic[3] == '4' || header.magic[3] == '5'));
+    if (!valid_magic) {
         std::cerr << "Invalid or corrupted bin file: " << in_path << "\n";
         return;
     }
+    const bool has_frame_keyflags = (header.magic[3] == '4' || header.magic[3] == '5');
+    const bool has_frame_quality = (header.magic[3] == '5');
 
     if (header.block_size != 8 && header.block_size != 16 && header.block_size != 32) {
         std::cerr << "Unsupported block_size " << header.block_size << " in file.\n";
@@ -361,9 +548,6 @@ void decompress_flipbook(const std::string& in_path, const std::string& out_dir)
 
     Frame prev_recon = frame_create(header.width, header.height, header.channels, use_ycbcr, bs);
     Frame curr_recon = frame_create(header.width, header.height, header.channels, use_ycbcr, bs);
-
-    const QuantMatrix luma_qm = make_quant_matrix(kJpegLumaQuant, header.quality, bs);
-    const QuantMatrix chroma_qm = make_quant_matrix(kJpegChromaQuant, header.quality, bs);
 
     stbi_write_png_compression_level = 1;
 
@@ -382,6 +566,27 @@ void decompress_flipbook(const std::string& in_path, const std::string& out_dir)
 
     for (int f_idx = 0; f_idx < header.frame_count; ++f_idx) {
         bool is_keyframe = (f_idx == 0);
+        int frame_quality = header.quality;
+        if (has_frame_keyflags) {
+            uint8_t keyflag = 0;
+            in.read(reinterpret_cast<char*>(&keyflag), 1);
+            if (!in) {
+                std::cerr << "\nCorrupt frame keyflag at frame " << f_idx << "\n";
+                return;
+            }
+            is_keyframe = (keyflag != 0);
+        }
+        if (has_frame_quality) {
+            uint8_t q = 0;
+            in.read(reinterpret_cast<char*>(&q), 1);
+            if (!in) {
+                std::cerr << "\nCorrupt frame quality at frame " << f_idx << "\n";
+                return;
+            }
+            frame_quality = clamp_quality(static_cast<int>(q));
+        }
+        const QuantMatrix luma_qm = make_quant_matrix(kJpegLumaQuant, frame_quality, bs);
+        const QuantMatrix chroma_qm = make_quant_matrix(kJpegChromaQuant, frame_quality, bs);
         auto t_decode_start = std::chrono::high_resolution_clock::now();
 
         for (int ch = 0; ch < curr_recon.channels; ++ch) {
@@ -474,12 +679,37 @@ void decompress_flipbook(const std::string& in_path, const std::string& out_dir)
             }
 
 #ifdef USE_OMP
-#pragma omp parallel for
-#endif
-            for (int by = 0; by < blocks_y; ++by) {
+#pragma omp parallel
+            {
                 std::vector<float> dct_out(static_cast<size_t>(bpp));
                 std::vector<float> idct_out(static_cast<size_t>(bpp));
                 std::vector<float> prev_block(static_cast<size_t>(bpp));
+#pragma omp for
+                for (int by = 0; by < blocks_y; ++by) {
+                    for (int bx = 0; bx < blocks_x; ++bx) {
+                        int sample_idx = (by * blocks_x + bx) * bpp;
+                        for (int j = 0; j < bpp; ++j)
+                            dct_out[j] =
+                                static_cast<float>(channel_buffer[sample_idx + zigzag[j]]) * qm[j];
+
+                        idct2d_separable_n(dct_out.data(), idct_out.data(), bs);
+
+                        if (!is_keyframe) {
+                            extract_block_n(prev_channel, padded_w, bx, by, bs, prev_block.data());
+                            for (int i = 0; i < bpp; ++i) idct_out[i] += prev_block[i];
+                        } else {
+                            level_shift_n(idct_out.data(), bpp, 128.0f);
+                        }
+
+                        insert_block_n(recon_channel, padded_w, bx, by, bs, idct_out.data());
+                    }
+                }
+            }
+#else
+            std::vector<float> dct_out(static_cast<size_t>(bpp));
+            std::vector<float> idct_out(static_cast<size_t>(bpp));
+            std::vector<float> prev_block(static_cast<size_t>(bpp));
+            for (int by = 0; by < blocks_y; ++by) {
                 for (int bx = 0; bx < blocks_x; ++bx) {
                     int sample_idx = (by * blocks_x + bx) * bpp;
                     for (int j = 0; j < bpp; ++j)
@@ -498,6 +728,7 @@ void decompress_flipbook(const std::string& in_path, const std::string& out_dir)
                     insert_block_n(recon_channel, padded_w, bx, by, bs, idct_out.data());
                 }
             }
+#endif
         }
 
         auto t_decode_end = std::chrono::high_resolution_clock::now();

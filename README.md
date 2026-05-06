@@ -59,6 +59,9 @@ To compress a folder of images (PNG, JPG, or EXR):
 - `-q <1-100>`: Set quality (higher is better). Default is 50.
 - `-b <8|16|32>`: Set DCT block size. Larger blocks can improve compression. Default is 8.
 - `--no-ycbcr`: Skip color conversion (compress RGB directly).
+- `--adaptive-roi`: Enable adaptive ROI compression (available for all backends).
+- `--roi-strength <0.0-1.0>`: Control adaptive ROI intensity (default: `0.55`).
+- `--heatmap-video <out.mp4>`: Generate a separate compression heatmap video after compression.
 
 ### Decompression
 To restore images from a binary file:
@@ -84,6 +87,41 @@ We provide several scripts to test performance and quality:
   ```bash
   bash scripts/profile_gpu.sh
   ```
+- **Compression Heatmap Video**: Build an overlay video that shows where compression was stronger/weaker.
+  ```bash
+  python scripts/make_heatmap_video.py --manifest output.bin.heatmap_data/manifest.tsv --output heatmap.mp4
+  ```
+
+- **Live camera compression (target Mbps)**: Capture webcam frames and compress in real-time chunks using CUDA backend.
+  ```bash
+  python scripts/live_camera_compress.py --target-mbps 8 --camera 0 --fps 30 --chunk-seconds 1.0 --quality 70 --scene-cut-threshold 22
+  ```
+  Output chunks are written to `live_stream_output/chunks/` with `live_stream_output/manifest.tsv`.
+
+- **Live video chat transport (no .bin files)**: real-time camera sender/receiver over TCP with compressed frames and target Mbps control.
+  ```bash
+  # Terminal 1 (receiver)
+  python scripts/live_video_chat.py receiver --bind 0.0.0.0 --port 5000 --show-latency
+
+  # Terminal 2 (sender)
+  python scripts/live_video_chat.py sender --host 127.0.0.1 --port 5000 --camera 0 --target-mbps 3.0 --preview --quality-slider --max-fps
+  ```
+  Press `q` in sender/receiver window to stop.
+  Use the `Quality` slider in sender window to change compression on the fly (bitrate changes accordingly).
+
+- **Live video chat with your CUDA codec (`flipbook_cuda`)**: uses your project compressor/decompressor in real-time chunks over TCP.
+  Build the runtime library first:
+  ```bash
+  cmake --build build --config Release --target realtime_codec
+  ```
+  ```bash
+  # Terminal 1 (receiver)
+  python scripts/live_video_chat_cuda.py receiver --bind 0.0.0.0 --port 6000 --show-latency
+
+  # Terminal 2 (sender)
+  python scripts/live_video_chat_cuda.py sender --host 127.0.0.1 --port 6000 --camera 0 --target-mbps 2.0 --preview --quality-slider --max-fps
+  ```
+  This mode uses in-memory codec packets (no per-frame subprocess/temp chunk files).
 
 ---
 
@@ -96,6 +134,21 @@ For deep technical details, check the internal documentation:
 - **[GPU Huffman Bitstream](docs/GPU_HUFFMAN_BITSTREAM.md)**: Our parallel bit-packing format for GPU entropy coding.
 - **[Pipeline Threading](docs/PIPELINE_THREADING.md)**: Information on the producer-consumer model for I/O and parsing.
 - **[Profiling & Benchmarking](docs/PROFILING_AND_BASELINE.md)**: Guide on using Nsight Systems and capturing performance baselines.
+
+---
+
+## Realtime In-Memory API (CUDA)
+
+For low-latency transport without per-frame disk I/O, a manual in-memory codec API is available in:
+
+- `src/realtime/in_memory_codec.h`
+- `src/realtime/in_memory_codec.cpp`
+
+It provides:
+- `CudaRealtimeEncoder::encode_frame(...)` -> `RealtimeEncodedFrame` packet in memory
+- `CudaRealtimeDecoder::decode_frame(...)` -> decoded interleaved RGB frame in memory
+
+Use this API inside your own TCP/UDP/WebRTC loop to avoid subprocess+temp-file overhead.
 
 ---
 

@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstring>
 #include <utility>
+#include <algorithm>
 #include <cuda_runtime.h>
 
 #ifndef M_PI
@@ -20,8 +21,6 @@
             exit(EXIT_FAILURE);                                                 \
         }                                                                       \
     } while (0)
-#define M_PI_F 3.14159265358979323846f
-
 __device__ __forceinline__ float ld_u8_as_float(const uint8_t* p) {
     return static_cast<float>(__ldg(p));
 }
@@ -115,9 +114,10 @@ __device__ void idct2d_device(const float* __restrict__ in, float* __restrict__ 
 
 template<int BS>
 __global__ void encode_blocks_kernel(
-    const uint8_t* src, const uint8_t* prev, uint8_t* recon,
+    const uint8_t* src, const uint8_t* pred, uint8_t* recon,
     int16_t* coeffs, const float* qm, const int* zigzag,
-    int padded_w, int padded_h, bool is_keyframe)
+    int padded_w, int padded_h, bool is_keyframe, bool adaptive_roi, float roi_strength,
+    float* qscale_map)
 {
     const int tid = threadIdx.x;
     if (tid >= BS * BS) return;
@@ -140,7 +140,7 @@ __global__ void encode_blocks_kernel(
     const int idx = row * padded_w + col;
     const float val = ld_u8_as_float(src + idx);
     if (!is_keyframe) {
-        const float pval = ld_u8_as_float(prev + idx);
+        const float pval = ld_u8_as_float(pred + idx);
         s_blk[tid] = val - pval;
     } else {
         s_blk[tid] = val - 128.0f;
@@ -169,11 +169,33 @@ __global__ void encode_blocks_kernel(
     }
     __syncthreads();
 
+    float q_scale = 1.0f;
+    if (adaptive_roi) {
+        float sum_abs = 0.0f;
+        for (int i = tid; i < BS * BS; i += blockDim.x) {
+            sum_abs += fabsf(s_blk[i]);
+        }
+        s_tmp[tid] = sum_abs;
+        __syncthreads();
+        for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (tid < stride) s_tmp[tid] += s_tmp[tid + stride];
+            __syncthreads();
+        }
+        const float avg_abs = s_tmp[0] / static_cast<float>(BS * BS);
+        const float importance = 1.0f - expf(-avg_abs / 18.0f);
+        q_scale = 1.0f + roi_strength * (0.5f - importance);
+        q_scale = fminf(fmaxf(q_scale, 0.60f), 1.60f);
+    }
+    if (qscale_map && tid == 0) {
+        qscale_map[block_idx] = q_scale;
+    }
+    __syncthreads();
+
     {
         const int i = tid;
-        float q_val = roundf(s_mid[i] / qm[i]);
+        float q_val = roundf(s_mid[i] / (qm[i] * q_scale));
         coeffs[block_idx * BS * BS + zigzag[i]] = static_cast<int16_t>(q_val);
-        s_mid[i] = q_val * qm[i];
+        s_mid[i] = q_val * (qm[i] * q_scale);
     }
     __syncthreads();
 
@@ -203,7 +225,7 @@ __global__ void encode_blocks_kernel(
 
     float rval = s_blk[tid];
     if (!is_keyframe) {
-        rval += ld_u8_as_float(prev + idx);
+        rval += ld_u8_as_float(pred + idx);
     } else {
         rval += 128.0f;
     }
@@ -213,7 +235,7 @@ __global__ void encode_blocks_kernel(
 template<int BS>
 __global__ void decode_blocks_kernel(
         const int16_t* __restrict__ coeff_in,
-        const uint8_t*   __restrict__ prev,
+        const uint8_t*   __restrict__ pred,
         uint8_t*         __restrict__ recon,
         const float*   __restrict__ qm,
         const int*     __restrict__ zigzag,
@@ -242,7 +264,7 @@ __global__ void decode_blocks_kernel(
         float s = 0.f;
         for (int k = 0; k < BS; ++k) {
             const float ck = (k == 0) ? 0.70710678118f : 1.0f;
-            s += ck * s_coeff[k * BS + cc] * cosf(M_PI_F * (2.0f * n + 1.0f) * k / (2.0f * BS));
+            s += ck * s_coeff[k * BS + cc] * get_cos<BS>(k, n);
         }
         s_tmp[n * BS + cc] = 0.5f * s;
     }
@@ -254,7 +276,7 @@ __global__ void decode_blocks_kernel(
         float s = 0.f;
         for (int k = 0; k < BS; ++k) {
             const float ck = (k == 0) ? 0.70710678118f : 1.0f;
-            s += ck * s_tmp[rr * BS + k] * cosf(M_PI_F * (2.0f * n + 1.0f) * k / (2.0f * BS));
+            s += ck * s_tmp[rr * BS + k] * get_cos<BS>(k, n);
         }
         s_spat[rr * BS + n] = 0.5f * s;
     }
@@ -267,23 +289,152 @@ __global__ void decode_blocks_kernel(
     const int idx = row * padded_w + col;
     float rval = s_spat[tid];
     if (!is_keyframe) {
-        rval += ld_u8_as_float(prev + idx);
+        rval += ld_u8_as_float(pred + idx);
     } else {
         rval += 128.0f;
     }
     recon[idx] = static_cast<uint8_t>(fminf(fmaxf(roundf(rval), 0.0f), 255.0f));
 }
 
+__device__ __forceinline__ int block_sad_at(
+    const uint8_t* __restrict__ prev,
+    const uint8_t* __restrict__ src,
+    int pw, int ph, int bs,
+    int x0, int y0, int mx, int my)
+{
+    int sad = 0;
+    for (int yy = 0; yy < bs; ++yy) {
+        const int sy = y0 + yy;
+        if (sy >= ph) break;
+        for (int xx = 0; xx < bs; ++xx) {
+            const int sx = x0 + xx;
+            if (sx >= pw) break;
+            int px = sx + mx;
+            int py = sy + my;
+            px = max(0, min(pw - 1, px));
+            py = max(0, min(ph - 1, py));
+            sad += abs(static_cast<int>(src[sy * pw + sx]) - static_cast<int>(prev[py * pw + px]));
+        }
+    }
+    return sad;
+}
+
+__global__ void block_sad_me_kernel(
+    const uint8_t* __restrict__ prev,
+    const uint8_t* __restrict__ src,
+    int8_t* __restrict__ mv_out,
+    int pw, int ph, int bs, int R)
+{
+    const int bx = blockIdx.x;
+    const int by = blockIdx.y;
+    const int grid_w = gridDim.x;
+    const int x0 = bx * bs;
+    const int y0 = by * bs;
+    if (x0 >= pw || y0 >= ph) return;
+
+    int best_mx = 0, best_my = 0;
+    int best_sad = block_sad_at(prev, src, pw, ph, bs, x0, y0, 0, 0);
+
+    // Fast ME: logarithmic step search + local 3x3 refinement.
+    int step = 1;
+    while (step < R) step <<= 1;
+    step >>= 1;
+    if (step < 1) step = 1;
+
+    while (step >= 1) {
+        int cand_best_mx = best_mx;
+        int cand_best_my = best_my;
+        int cand_best_sad = best_sad;
+        for (int oy = -1; oy <= 1; ++oy) {
+            for (int ox = -1; ox <= 1; ++ox) {
+                const int mx = max(-R, min(R, best_mx + ox * step));
+                const int my = max(-R, min(R, best_my + oy * step));
+                const int sad = block_sad_at(prev, src, pw, ph, bs, x0, y0, mx, my);
+                if (sad < cand_best_sad) {
+                    cand_best_sad = sad;
+                    cand_best_mx = mx;
+                    cand_best_my = my;
+                }
+            }
+        }
+        best_sad = cand_best_sad;
+        best_mx = cand_best_mx;
+        best_my = cand_best_my;
+        step >>= 1;
+    }
+
+    for (int oy = -1; oy <= 1; ++oy) {
+        for (int ox = -1; ox <= 1; ++ox) {
+            const int mx = max(-R, min(R, best_mx + ox));
+            const int my = max(-R, min(R, best_my + oy));
+            const int sad = block_sad_at(prev, src, pw, ph, bs, x0, y0, mx, my);
+            if (sad < best_sad) {
+                best_sad = sad;
+                best_mx = mx;
+                best_my = my;
+            }
+        }
+    }
+
+    const int bi = by * grid_w + bx;
+    mv_out[bi * 2 + 0] = static_cast<int8_t>(max(-128, min(127, best_mx)));
+    mv_out[bi * 2 + 1] = static_cast<int8_t>(max(-128, min(127, best_my)));
+}
+
+template<int BS>
+__global__ void warp_mc_kernel(
+    const uint8_t* __restrict__ prev,
+    uint8_t* __restrict__ pred,
+    const int8_t* __restrict__ mv_luma,
+    int pw, int ph,
+    int luma_grid_w,
+    int chroma420)
+{
+    const int tid = threadIdx.x;
+    if (tid >= BS * BS) return;
+    const int bx = blockIdx.x;
+    const int by = blockIdx.y;
+    const int grid_w = gridDim.x;
+    const int x0 = bx * BS;
+    const int y0 = by * BS;
+    const int r = tid / BS;
+    const int c = tid % BS;
+    const int x = x0 + c;
+    const int y = y0 + r;
+    if (x >= pw || y >= ph) return;
+
+    int mv_idx;
+    if (chroma420) {
+        mv_idx = (by * 2) * luma_grid_w + (bx * 2);
+    } else {
+        mv_idx = by * grid_w + bx;
+    }
+    int mx = static_cast<int>(mv_luma[mv_idx * 2 + 0]);
+    int my = static_cast<int>(mv_luma[mv_idx * 2 + 1]);
+    if (chroma420) {
+        mx >>= 1;
+        my >>= 1;
+    }
+    int px = x + mx;
+    int py = y + my;
+    px = max(0, min(pw - 1, px));
+    py = max(0, min(ph - 1, py));
+    pred[y * pw + x] = prev[py * pw + px];
+}
+
 
 struct GpuChannel {
     int pw, ph, pixels;
     uint8_t *d_prev, *d_curr;
+    uint8_t *d_mc_pred;
+    uint8_t *d_inter_pred;
     uint8_t *d_src_ping[2];
     int16_t *d_coeff;
 
     uint8_t*  d_packed;
     size_t    packed_bytes;
     uint32_t* d_block_bit_lengths;
+    float*    d_qscale_map;
 
     struct PinnedMetadata {
         uint32_t rle_bytes;
@@ -304,6 +455,16 @@ static bool         g_allocated      = false;
 
 static int g_bs = 8;
 static int g_pw[MAX_CH] = {}, g_ph[MAX_CH] = {};
+static bool g_adaptive_roi = false;
+static float g_roi_strength = 0.55f;
+
+static bool g_motion_predict = false;
+static int g_motion_radius = 8;
+static int8_t* g_d_mv_luma = nullptr;
+static int g_mv_luma_pairs = 0;
+static int g_luma_mv_grid_w = 0;
+static cudaEvent_t g_evt_motion_done = nullptr;
+static bool g_encode_wait_motion = false;
 
 static uint8_t* g_h_rgb_in  = nullptr;
 static uint8_t* g_h_rgb_out = nullptr;
@@ -316,11 +477,13 @@ static inline int pad_bs(int n, int bs) { return ((n + bs - 1) / bs) * bs; }
 
 
 void cuda_init() {
+    g_motion_predict = false;
     cuda_init_dct_constants();
     CUDA_CHECK(cudaSetDevice(0));
     for (int i = 0; i < MAX_CH; ++i)
         CUDA_CHECK(cudaStreamCreate(&g_stream[i]));
     CUDA_CHECK(cudaStreamCreate(&g_transfer_stream));
+    CUDA_CHECK(cudaEventCreateWithFlags(&g_evt_motion_done, cudaEventDisableTiming));
 }
 
 void cuda_cleanup() {
@@ -329,6 +492,10 @@ void cuda_cleanup() {
     for (int i = 0; i < MAX_CH; ++i)
         if (g_stream[i]) { cudaStreamDestroy(g_stream[i]); g_stream[i] = nullptr; }
     if (g_transfer_stream) { cudaStreamDestroy(g_transfer_stream); g_transfer_stream = nullptr; }
+    if (g_evt_motion_done) {
+        cudaEventDestroy(g_evt_motion_done);
+        g_evt_motion_done = nullptr;
+    }
 }
 
 void cuda_alloc_frame_buffers(int width, int height, int channels,
@@ -354,14 +521,19 @@ void cuda_alloc_frame_buffers(int width, int height, int channels,
         CUDA_CHECK(cudaMalloc(&g_ch[i].d_src_ping[1], bytes));
         CUDA_CHECK(cudaMalloc(&g_ch[i].d_prev, bytes));
         CUDA_CHECK(cudaMalloc(&g_ch[i].d_curr, bytes));
+        CUDA_CHECK(cudaMalloc(&g_ch[i].d_mc_pred, bytes));
         CUDA_CHECK(cudaMemset(g_ch[i].d_prev, 0, bytes));
         CUDA_CHECK(cudaMemset(g_ch[i].d_curr, 0, bytes));
+        CUDA_CHECK(cudaMemset(g_ch[i].d_mc_pred, 0, bytes));
+        g_ch[i].d_inter_pred = g_ch[i].d_prev;
         size_t cf_bytes = (size_t)pw * ph * sizeof(int16_t);
         CUDA_CHECK(cudaMalloc(&g_ch[i].d_coeff, cf_bytes));
         CUDA_CHECK(cudaMemset(g_ch[i].d_coeff, 0, cf_bytes));
 
         size_t nb = (size_t)(pw / block_size) * (ph / block_size);
         CUDA_CHECK(cudaMalloc(&g_ch[i].d_block_bit_lengths, nb * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMalloc(&g_ch[i].d_qscale_map, nb * sizeof(float)));
+        CUDA_CHECK(cudaMemset(g_ch[i].d_qscale_map, 0, nb * sizeof(float)));
 
         rle_gpu_init(i, pw * ph);
         CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&g_ch[i].h_metadata), sizeof(GpuChannel::PinnedMetadata), cudaHostAllocMapped));
@@ -387,6 +559,14 @@ void cuda_alloc_frame_buffers(int width, int height, int channels,
         CUDA_CHECK(cudaEventCreateWithFlags(&g_evt_encode_slot_done[s], cudaEventDisableTiming));
     }
 
+    g_luma_mv_grid_w = g_ch[0].pw / block_size;
+    {
+        const int nb0 = g_luma_mv_grid_w * (g_ch[0].ph / block_size);
+        g_mv_luma_pairs = nb0;
+        CUDA_CHECK(cudaMalloc(&g_d_mv_luma, static_cast<size_t>(nb0) * 2u * sizeof(int8_t)));
+        CUDA_CHECK(cudaMemset(g_d_mv_luma, 0, static_cast<size_t>(nb0) * 2u * sizeof(int8_t)));
+    }
+
     g_allocated = true;
 }
 
@@ -396,14 +576,23 @@ void cuda_free_frame_buffers() {
         cudaFree(g_ch[i].d_src_ping[0]); cudaFree(g_ch[i].d_src_ping[1]);
         cudaFree(g_ch[i].d_prev);
         cudaFree(g_ch[i].d_curr);
+        cudaFree(g_ch[i].d_mc_pred);
         cudaFree(g_ch[i].d_coeff);
         cudaFree(g_ch[i].d_block_bit_lengths);
+        cudaFree(g_ch[i].d_qscale_map);
         if (g_ch[i].h_metadata) {
             cudaFreeHost(g_ch[i].h_metadata); 
         }
         g_ch[i].h_metadata = nullptr;
         g_ch[i].d_metadata = nullptr;
+        g_ch[i].d_mc_pred = nullptr;
+        g_ch[i].d_inter_pred = nullptr;
     }
+    if (g_d_mv_luma) {
+        cudaFree(g_d_mv_luma);
+        g_d_mv_luma = nullptr;
+    }
+    g_mv_luma_pairs = 0;
     rle_gpu_cleanup();
     for (auto& p : g_d_qm) { cudaFree(p); p = nullptr; }
     if (g_d_zigzag) { cudaFree(g_d_zigzag); g_d_zigzag = nullptr; }
@@ -459,28 +648,139 @@ void cuda_download_coeffs(int ch, int16_t* host_dst, int num_coeffs) {
                           cudaMemcpyDeviceToHost));
 }
 
+static void launch_warp_mc(int block_size, cudaStream_t st, int ch, int chroma420_flag) {
+    auto& buf = g_ch[ch];
+    const int pw = buf.pw;
+    const int ph = buf.ph;
+    dim3 grid(pw / block_size, ph / block_size);
+    if (block_size == 8) {
+        warp_mc_kernel<8><<<grid, 64, 0, st>>>(
+            buf.d_prev, buf.d_mc_pred, g_d_mv_luma, pw, ph, g_luma_mv_grid_w, chroma420_flag);
+    } else if (block_size == 16) {
+        warp_mc_kernel<16><<<grid, 256, 0, st>>>(
+            buf.d_prev, buf.d_mc_pred, g_d_mv_luma, pw, ph, g_luma_mv_grid_w, chroma420_flag);
+    } else {
+        warp_mc_kernel<32><<<grid, 1024, 0, st>>>(
+            buf.d_prev, buf.d_mc_pred, g_d_mv_luma, pw, ph, g_luma_mv_grid_w, chroma420_flag);
+    }
+}
+
+void cuda_set_motion_predict(bool enabled, int search_radius) {
+    g_motion_predict = enabled;
+    g_motion_radius = std::max(1, std::min(32, search_radius));
+}
+
+void cuda_prepare_encode_prediction(int src_slot, bool is_keyframe, bool use_motion_for_frame,
+                                    bool use_ycbcr, int channels) {
+    cudaStream_t st = g_stream[0];
+    g_encode_wait_motion = false;
+    if (!g_motion_predict || is_keyframe || !use_motion_for_frame) {
+        for (int ch = 0; ch < channels; ++ch)
+            g_ch[ch].d_inter_pred = g_ch[ch].d_prev;
+        CUDA_CHECK(cudaEventRecord(g_evt_motion_done, st));
+        return;
+    }
+
+    g_encode_wait_motion = true;
+    const int s = src_slot & 1;
+    const int bs = g_bs;
+    CUDA_CHECK(cudaStreamWaitEvent(st, g_evt_h2d_done[s]));
+
+    const int pw0 = g_ch[0].pw;
+    const int ph0 = g_ch[0].ph;
+    dim3 me_grid(pw0 / bs, ph0 / bs);
+    block_sad_me_kernel<<<me_grid, 1, 0, st>>>(
+        g_ch[0].d_prev, g_ch[0].d_src_ping[s], g_d_mv_luma, pw0, ph0, bs, g_motion_radius);
+
+    launch_warp_mc(bs, st, 0, 0);
+    g_ch[0].d_inter_pred = g_ch[0].d_mc_pred;
+
+    const bool chroma420 = use_ycbcr && channels >= 3;
+    for (int ch = 1; ch < channels; ++ch) {
+        launch_warp_mc(bs, st, ch, chroma420 ? 1 : 0);
+        g_ch[ch].d_inter_pred = g_ch[ch].d_mc_pred;
+    }
+
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaEventRecord(g_evt_motion_done, st));
+}
+
+void cuda_prepare_decode_prediction(bool is_keyframe, const int8_t* host_mv_luma, size_t mv_bytes,
+                                    bool use_ycbcr, int channels) {
+    cudaStream_t st = g_stream[0];
+    const size_t expected = static_cast<size_t>(g_mv_luma_pairs) * 2u * sizeof(int8_t);
+    if (!g_motion_predict || is_keyframe || !host_mv_luma || mv_bytes < expected) {
+        for (int ch = 0; ch < channels; ++ch)
+            g_ch[ch].d_inter_pred = g_ch[ch].d_prev;
+        CUDA_CHECK(cudaStreamSynchronize(st));
+        return;
+    }
+
+    CUDA_CHECK(cudaMemcpyAsync(g_d_mv_luma, host_mv_luma, expected, cudaMemcpyHostToDevice, st));
+    const int bs = g_bs;
+    launch_warp_mc(bs, st, 0, 0);
+    g_ch[0].d_inter_pred = g_ch[0].d_mc_pred;
+
+    const bool chroma420 = use_ycbcr && channels >= 3;
+    for (int ch = 1; ch < channels; ++ch) {
+        launch_warp_mc(bs, st, ch, chroma420 ? 1 : 0);
+        g_ch[ch].d_inter_pred = g_ch[ch].d_mc_pred;
+    }
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaStreamSynchronize(st));
+}
+
+void cuda_download_mv_luma(int8_t* host_dst, int num_mv_pairs) {
+    if (!host_dst || num_mv_pairs <= 0 || !g_d_mv_luma) return;
+    const size_t bytes = static_cast<size_t>(num_mv_pairs) * 2u * sizeof(int8_t);
+    CUDA_CHECK(cudaMemcpy(host_dst, g_d_mv_luma, bytes, cudaMemcpyDeviceToHost));
+}
+
 void cuda_encode_channel(int ch, int pw, int ph, int block_size, bool is_keyframe, int src_slot) {
     auto& buf    = g_ch[ch];
     auto  stream = g_stream[ch];
     const float* qm = (ch == 0) ? g_d_qm[0] : g_d_qm[1];
     const int s = src_slot & 1;
     CUDA_CHECK(cudaStreamWaitEvent(stream, g_evt_h2d_done[s]));
+    if (g_encode_wait_motion)
+        CUDA_CHECK(cudaStreamWaitEvent(stream, g_evt_motion_done));
 
     uint8_t* d_src = buf.d_src_ping[s];
+    uint8_t* d_pred = buf.d_inter_pred ? buf.d_inter_pred : buf.d_prev;
     dim3 grid(pw / block_size, ph / block_size);
     const size_t shared_mem = 3u * (size_t)block_size * (size_t)block_size * sizeof(float);
 
     if (block_size == 8) {
         encode_blocks_kernel<8><<<grid, 64, shared_mem, stream>>>(
-            d_src, buf.d_prev, buf.d_curr, buf.d_coeff, qm, g_d_zigzag, pw, ph, is_keyframe);
+            d_src, d_pred, buf.d_curr, buf.d_coeff, qm, g_d_zigzag, pw, ph, is_keyframe,
+            g_adaptive_roi, g_roi_strength, buf.d_qscale_map);
     } else if (block_size == 16) {
         encode_blocks_kernel<16><<<grid, 256, shared_mem, stream>>>(
-            d_src, buf.d_prev, buf.d_curr, buf.d_coeff, qm, g_d_zigzag, pw, ph, is_keyframe);
+            d_src, d_pred, buf.d_curr, buf.d_coeff, qm, g_d_zigzag, pw, ph, is_keyframe,
+            g_adaptive_roi, g_roi_strength, buf.d_qscale_map);
     } else if (block_size == 32) {
         encode_blocks_kernel<32><<<grid, 1024, shared_mem, stream>>>(
-            d_src, buf.d_prev, buf.d_curr, buf.d_coeff, qm, g_d_zigzag, pw, ph, is_keyframe);
+            d_src, d_pred, buf.d_curr, buf.d_coeff, qm, g_d_zigzag, pw, ph, is_keyframe,
+            g_adaptive_roi, g_roi_strength, buf.d_qscale_map);
     }
     CUDA_CHECK(cudaGetLastError());
+}
+
+void cuda_set_adaptive_roi(bool enabled, float strength) {
+    g_adaptive_roi = enabled;
+    g_roi_strength = fminf(fmaxf(strength, 0.0f), 1.0f);
+}
+
+void cuda_update_quant_matrices(const float* luma_qm, const float* chroma_qm, int block_size) {
+    const size_t coeff_count = static_cast<size_t>(block_size) * static_cast<size_t>(block_size);
+    CUDA_CHECK(cudaMemcpy(g_d_qm[0], luma_qm, coeff_count * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(g_d_qm[1], chroma_qm, coeff_count * sizeof(float), cudaMemcpyHostToDevice));
+}
+
+void cuda_download_qscale_map(int ch, float* host_dst, int num_blocks) {
+    if (!host_dst || num_blocks <= 0) return;
+    CUDA_CHECK(cudaMemcpy(host_dst, g_ch[ch].d_qscale_map, static_cast<size_t>(num_blocks) * sizeof(float),
+                          cudaMemcpyDeviceToHost));
 }
 
 void cuda_record_encode_slot_done(int slot, int last_ch) {
@@ -526,18 +826,19 @@ void cuda_decode_channel(int ch, const int16_t* coeff_in,
     CUDA_CHECK(cudaMemcpyAsync(buf.d_coeff, coeff_in,
                coeffs_to_copy * sizeof(int16_t), cudaMemcpyHostToDevice, stream));
 
+    uint8_t* d_pred = buf.d_inter_pred ? buf.d_inter_pred : buf.d_prev;
     dim3 grid(pw / block_size, ph / block_size);
     const size_t shared_mem = 3u * (size_t)block_size * (size_t)block_size * sizeof(float);
 
     if (block_size == 8) {
         decode_blocks_kernel<8><<<grid, 64, shared_mem, stream>>>(
-            buf.d_coeff, buf.d_prev, buf.d_curr, qm, g_d_zigzag, pw, ph, is_keyframe);
+            buf.d_coeff, d_pred, buf.d_curr, qm, g_d_zigzag, pw, ph, is_keyframe);
     } else if (block_size == 16) {
         decode_blocks_kernel<16><<<grid, 256, shared_mem, stream>>>(
-            buf.d_coeff, buf.d_prev, buf.d_curr, qm, g_d_zigzag, pw, ph, is_keyframe);
+            buf.d_coeff, d_pred, buf.d_curr, qm, g_d_zigzag, pw, ph, is_keyframe);
     } else if (block_size == 32) {
         decode_blocks_kernel<32><<<grid, 1024, shared_mem, stream>>>(
-            buf.d_coeff, buf.d_prev, buf.d_curr, qm, g_d_zigzag, pw, ph, is_keyframe);
+            buf.d_coeff, d_pred, buf.d_curr, qm, g_d_zigzag, pw, ph, is_keyframe);
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -589,15 +890,16 @@ void cuda_full_decode_channel(int ch,
     dim3 grid(pw / block_size, ph / block_size);
     const size_t shared_mem = 3u * (size_t)block_size * (size_t)block_size * sizeof(float);
 
+    uint8_t* d_pred = buf.d_inter_pred ? buf.d_inter_pred : buf.d_prev;
     if (block_size == 8) {
         decode_blocks_kernel<8><<<grid, 64, shared_mem, stream>>>(
-            buf.d_coeff, buf.d_prev, buf.d_curr, qm, g_d_zigzag, pw, ph, is_keyframe);
+            buf.d_coeff, d_pred, buf.d_curr, qm, g_d_zigzag, pw, ph, is_keyframe);
     } else if (block_size == 16) {
         decode_blocks_kernel<16><<<grid, 256, shared_mem, stream>>>(
-            buf.d_coeff, buf.d_prev, buf.d_curr, qm, g_d_zigzag, pw, ph, is_keyframe);
+            buf.d_coeff, d_pred, buf.d_curr, qm, g_d_zigzag, pw, ph, is_keyframe);
     } else if (block_size == 32) {
         decode_blocks_kernel<32><<<grid, 1024, shared_mem, stream>>>(
-            buf.d_coeff, buf.d_prev, buf.d_curr, qm, g_d_zigzag, pw, ph, is_keyframe);
+            buf.d_coeff, d_pred, buf.d_curr, qm, g_d_zigzag, pw, ph, is_keyframe);
     }
     CUDA_CHECK(cudaGetLastError());
 }

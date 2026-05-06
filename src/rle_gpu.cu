@@ -167,16 +167,16 @@ __global__ void HuffmanBlockBitLengthKernel(const int16_t* __restrict__ rle_in, 
     for (int mask = 16; mask > 0; mask >>= 1) {
         total += __shfl_xor_sync(0xffffffff, total, mask);
     }
-    
+
+    __shared__ uint32_t s_partials[32];
     if ((tid & 31) == 0) {
-        static __shared__ uint32_t s_partials[32];
         s_partials[tid >> 5] = total;
-        __syncthreads();
-        if (tid == 0) {
-            uint32_t final_total = 0;
-            for (int i = 0; i < (blockDim.x + 31) / 32; ++i) final_total += s_partials[i];
-            blen[bid] = final_total;
-        }
+    }
+    __syncthreads();
+    if (tid == 0) {
+        uint32_t final_total = 0;
+        for (int i = 0; i < (blockDim.x + 31) / 32; ++i) final_total += s_partials[i];
+        blen[bid] = final_total;
     }
 }
 
@@ -254,10 +254,10 @@ __global__ void HuffmanPrepareCodebookKernel(const uint32_t* hist, uint32_t* out
 }
 
 __global__ void UpdateRleMeta(const int* off, const int* cnt, int nb, GPU_PinnedMetadata* meta) { 
-    if (threadIdx.x==0 && blockIdx.x==0) meta->rle_bytes = (uint32_t)((off[nb-1]+cnt[nb-1])*2); 
+    if (threadIdx.x==0 && blockIdx.x==0) meta->rle_bytes = (nb > 0) ? (uint32_t)((off[nb-1]+cnt[nb-1])*2) : 0u;
 }
 __global__ void UpdatePackMeta(const uint32_t* off, const uint32_t* len, int nb, GPU_PinnedMetadata* meta) { 
-    if (threadIdx.x==0 && blockIdx.x==0) meta->pack_bytes = (off[nb-1]+len[nb-1]+7u)/8u; 
+    if (threadIdx.x==0 && blockIdx.x==0) meta->pack_bytes = (nb > 0) ? (off[nb-1]+len[nb-1]+7u)/8u : 0u;
 }
 
 

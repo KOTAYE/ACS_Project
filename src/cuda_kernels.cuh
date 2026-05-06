@@ -18,6 +18,16 @@ void cuda_submit_frame_h2d(int frame_index, const uint8_t* ptr[3], int channels)
 void cuda_download_planes(uint8_t* ptr[3], int channels);
 
 void cuda_encode_channel(int ch, int pw, int ph, int block_size, bool is_keyframe, int src_slot);
+void cuda_set_adaptive_roi(bool enabled, float strength);
+/// Block-based motion search (integer SAD) on luma ch0; warped prev is used as inter prediction (FLI6).
+void cuda_set_motion_predict(bool enabled, int search_radius);
+void cuda_prepare_encode_prediction(int src_slot, bool is_keyframe, bool use_motion_for_frame,
+                                    bool use_ycbcr, int channels);
+void cuda_prepare_decode_prediction(bool is_keyframe, const int8_t* host_mv_luma, size_t mv_bytes,
+                                    bool use_ycbcr, int channels);
+void cuda_download_mv_luma(int8_t* host_dst, int num_mv_pairs);
+void cuda_update_quant_matrices(const float* luma_qm, const float* chroma_qm, int block_size);
+void cuda_download_qscale_map(int ch, float* host_dst, int num_blocks);
 
 void cuda_record_encode_slot_done(int slot, int last_ch);
 void cuda_download_coeffs(int ch, int16_t* host_dst, int num_coeffs);
