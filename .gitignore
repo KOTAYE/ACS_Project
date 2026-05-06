@@ -165,6 +165,14 @@ _t2.bin
 _ci_*.bin
 _ci_recon_*/
 
+# Heavy generated artifacts
+video/
+frames_out/
+video_bad/
+live_stream_output/
+*.mp4
+*.bin
+
 # Large local asset/document files (keep out of pushes unless intentional)
 flipbooks/flipbook_textures1_FC.png
 *.pdf
